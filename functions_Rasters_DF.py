@@ -442,6 +442,164 @@ def is_in_ZEZIZPZLNI(patient, elec, plots):
 
 ############### Creation des tables de resultats par session ###############
 
+def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
+    """
+    Renvoie un tableau avec les quality metrics par unit. Besoin des fichiers neuroscope et klusters
+    """
+    import probeinterface as pi
+    from spikeinterface.extractors import read_neuroscope
+    import spikeinterface as si 
+    from spikeinterface.preprocessing import bandpass_filter
+
+    path_folder = root + f'Spike-sorting/Data_folders/{patient}/{patient}_stim{session}/'
+
+## 1) Charger recording + sorting depuis neuroscope
+    # (read_neuroscope suppose que les .res/.clu sont dans le même dossier que le .xml)
+    xml_path = f"{path_folder}/{patient}_stim{session}.xml"  
+    recording, sorting = read_neuroscope(xml_path, load_recording=True, load_sorting=True)
+
+## 2) charger probe geometry
+    n_tetrodes = mapping_anat.shape[0]
+    # positions: chaque tetrode = carré 2x2, tétrodes espacées
+    spacing_tetrode = 500.0  # µm
+    local = np.array([[0,0],[0,20],[20,0],[20,20]], dtype=float)  # 4 contacts proches
+    positions = np.zeros((n_tetrodes * 4, 2), dtype=float)
+    for t in range(n_tetrodes):
+        base = np.array([t * spacing_tetrode, 0.0])
+        positions[t*4:(t+1)*4] = local + base
+    probe = pi.Probe(ndim=2)
+    probe.set_contacts(positions=positions, shapes="circle", shape_params={"radius": 5})
+    probe.set_device_channel_indices(np.arange(n_tetrodes * 4))
+    recording = recording.set_probe(probe, in_place=False) # on associe le mapping au recording
+    
+
+## 3) Re-construct periods outside deadperiods, per electrode (pour calculer firing rate etc sur zones avec détection seulement)
+    # 3.A) Construct mapping electrode//tetrodes
+
+    mapping_anat["electrode"] = [tt[:-1] for tt in mapping_anat["tt"].tolist()] # depuis dgl1 renvoie dgl
+    # dict electrode -> liste des indices des tétrodes (clu)
+    elec_to_clus = mapping_anat.groupby("electrode")["clu"].apply(lambda x: sorted(set(x.astype(int)))).to_dict()
+
+    # 3.B) For each electrode: rec + deadfile + re-mapped sorting + QM
+
+        # 3.B.1) utilitary functions:
+    def load_dead_intervals_ts(deadfile_path: str, n_frames: int):
+        """Depuis deadfile, retourne des intervalles bad (start,end) en frames int64, triés, mergés, clipés."""
+        deadF = pd.read_csv(deadfile_path, sep="\t", header=None, names=["start", "end"])
+        bad = deadF[["start", "end"]].to_numpy(dtype=np.int64)
+        # tri + filtre
+        bad = bad[np.argsort(bad[:, 0])]
+        bad = bad[bad[:, 1] > bad[:, 0]]
+        # clip
+        bad[:, 0] = np.clip(bad[:, 0], 0, n_frames)
+        bad[:, 1] = np.clip(bad[:, 1], 0, n_frames)
+        bad = bad[bad[:, 1] > bad[:, 0]]
+        # merge overlap
+        merged = []
+        for s, e in bad:
+            if not merged or s > merged[-1][1]:
+                merged.append([int(s), int(e)])
+            else:
+                merged[-1][1] = max(merged[-1][1], int(e))
+        return np.array(merged, dtype=np.int64)
+
+    def invert_intervals_to_good(bad: np.ndarray, n_frames: int):
+        """Depuis les bad frames, retourne les good frames. 
+        bad: (N,2) frames, retourne good_chunks list[(s,e)] frames."""
+        good = []
+        start = 0
+        for s, e in bad:
+            if start < s:
+                good.append((start, int(s)))
+            start = max(start, int(e))
+        if start < n_frames:
+            good.append((start, n_frames))
+        return good
+
+    def build_concat_recording(recording, good_chunks):
+        """Depuis les good frames, retourne un recording concaténé."""
+        rec_list = [recording.frame_slice(start_frame=int(s), end_frame=int(e)) for s, e in good_chunks]
+        return si.concatenate_recordings(rec_list)
+
+    def remap_sorting_to_concat(sorting, good_chunks, fs):
+        """
+        Crée un sorting compressé correspondant au recording concaténé.
+        Suppose 1 segment.
+        """
+        old_starts = np.array([s for s, e in good_chunks], dtype=np.int64)
+        old_ends   = np.array([e for s, e in good_chunks], dtype=np.int64)
+        lengths    = old_ends - old_starts
+        new_starts = np.concatenate(([0], np.cumsum(lengths)[:-1])).astype(np.int64)
+
+        def map_old_to_new(x):
+            x = np.asarray(x, dtype=np.int64)
+            idx = np.searchsorted(old_starts, x, side="right") - 1
+            valid = (idx >= 0) & (x < old_ends[idx])
+            x = x[valid]
+            idx = idx[valid]
+            return new_starts[idx] + (x - old_starts[idx])
+
+        unit_dict = {}
+        for u in sorting.unit_ids:
+            st_old = sorting.get_unit_spike_train(u)  # frames
+            st_new = map_old_to_new(st_old)
+            unit_dict[u] = st_new
+
+        return si.NumpySorting.from_unit_dict(unit_dict, sampling_frequency=fs)
+
+    def select_units_by_group(sorting, groups):
+        groups = set(groups)
+        g = sorting.get_property("group")
+        unit_ids = [u for u, gg in zip(sorting.unit_ids, g) if int(gg) in groups]
+        return sorting.select_units(unit_ids)
+
+        # 3.B.2) run per electrode:
+    all_qm = [] # ce sera une liste de dataframes de QM (un par electrode)
+
+    for elec, clus in elec_to_clus.items():
+        deadfile_elec = dict_elec2deadfile[elec]
+
+        # sous-sorting (unités dont group ∈ clus)
+        sorting_e = select_units_by_group(sorting, clus)
+        if len(sorting_e.unit_ids) == 0:
+            continue
+
+        # sous-recording : canaux de l'electrode seulement
+        ch=[]
+        for tt in clus :
+            ch.append([str(tt*4-4), str(tt*4-3), str(tt*4-2), str(tt*4-1)])
+        ch = [x for xs in ch for x in xs] # on applatit la liste de listes en liste
+        recording_e = recording.select_channels(ch) 
+
+        # recording concaténé selon deadfile
+        n = recording_e.get_num_frames()
+        bad = load_dead_intervals_ts(deadfile_elec, n_frames=n)
+        good_chunks = invert_intervals_to_good(bad, n_frames=n)
+        recording_e_clean = build_concat_recording(recording_e, good_chunks)
+
+        # filtre signal (300-3000 Hz) avant calcul des metriques
+        recording_elec_f = bandpass_filter(recording=recording_e_clean, freq_min=300, freq_max=3000)
+
+        # remap spikes vers périodes concaténées
+        sr = get_SR(patient)
+        sorting_clean = remap_sorting_to_concat(sorting_e, good_chunks, sr)
+
+        # analyzer + qm
+        analyzer = si.create_sorting_analyzer(sorting_clean, recording_elec_f, format="memory", sparse=False)
+        analyzer.compute("random_spikes", method="uniform", max_spikes_per_unit=500, seed=0)
+        analyzer.compute("waveforms", ms_before=1.0, ms_after=2.0, n_jobs=1)
+        analyzer.compute("templates")
+        analyzer.compute("noise_levels")
+        qm = analyzer.compute("quality_metrics").get_data()
+
+        all_qm.append(qm)
+
+## 4) fusion des QM de toutes les electrodes
+    qm_all = pd.concat(all_qm, axis=0)
+    
+    return qm_all
+
+
 def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, mpg, patient, session, root, mapping_anat, start_baseline=0, end_baseline=300, epsilon=0.1, verb=False, bin_z=0.05, bin_resp=[0.05, 0.075, 0.1]):
     '''Cree un summary_session_df et general_session_df pour une session : summary_by_neuron et general_summary_by_neuron_and_stim
     epsilon : valeur tres petite pour calculer le log-ratio
@@ -459,17 +617,26 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
     # variables pour obtenir dynamiques temporelles par U de temps
     pre_duration, post_duration = 10, 10  # sec
     
-    for clu in all_clu_ids: # pour chaque neurone clu
-        # print('neuron',clu, ', elec ', dict_clu2tt[clu][:-1])
+    # on charge les quality metrics de chaque SU de la session
+    qm = quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, root)
+    qm.reset_index()
+
+    for ind_clu, clu in enumerate(all_clu_ids): # pour chaque neurone clu
+        
         spk_times = spikes[clu].index.dropna().values  # Liste des t des spikes de ce neurone en sec
-        # print('nb total de spikes:', len(spk_times))
+        
         if len(spk_times) == 0: # si aucun spike, on passe au neurone suivant
             continue
-
+        
+        # général :
         row = {'patient': patient, 'session':stimic_session, 'clu': clu, 'tetrode': dict_clu2tt[clu],
                'lobe_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
                'loca_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0]} # Initialisation de la ligne de ce neurone
         
+        # quality metrics :
+        for metric in qm.columns.tolist():
+            row[metric] = qm.loc[ind_clu, metric]
+
         # fr_global / Taux de décharge global :
         deadfile_elec = dict_elec2deadfile[dict_clu2tt[clu][:-1]]  # deadfile de l'electrode correspondante
         total_duration = get_total_duration(path_folder, patient, session, nb_channels(mapping_anat, patient, session, root)) - np.sum(deadfile_elec[1] - deadfile_elec[0]) # on soustrait deadperiods
@@ -582,6 +749,10 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                             'tt_in_ZE': ttZE, 'tt_in_ZI': ttZI, 'tt_in_ZP': ttZP, 'tt_in_ZL': ttZL, 'tt_in_NI': ttNI,
                             'distance_tt_stim': distance_tt_stim}
             
+            # quality metrics :
+            for metric in qm.columns.tolist():
+                row_general[metric] = qm.loc[ind_clu, metric]
+            
             # Time binned to get AP per time unit
             for ind_bin, bin_r_i in enumerate(bin_resp):
                 bins_edges_i = np.arange(0, post_duration + bin_r_i, bin_r_i)
@@ -601,6 +772,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                 # excit_then_inhib = np.append(excit_then_inhib, int(len(below) > 0 and len(above) > 0 and above[0] < below[0]))
                 # inhib_general = np.append(inhib_general, inhib_only[ind_bin] + inhib_then_excit[ind_bin])
                 # excit_general = np.append(excit_general, excit_only[ind_bin] + excit_then_inhib[ind_bin])
+                
                 # Ajout a data puis a data_general : 
                 row[f'{i}_{label_stim}_inhib_only_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) == 0) #inhib_only[ind_bin]
                 row[f'{i}_{label_stim}_excit_only_{bin_r_i}s_bins'] = int(len(above) > 0 and len(below) == 0) #excit_only[ind_bin]
