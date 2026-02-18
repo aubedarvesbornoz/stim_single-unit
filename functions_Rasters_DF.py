@@ -442,13 +442,12 @@ def is_in_ZEZIZPZLNI(patient, elec, plots):
 
 ############### Creation des tables de resultats par session ###############
 
-def Rec_Sort_SI_remapped_filt_elec(patient, session, elec, clus, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
+def RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root='/media/aube/Aube/'):
     """
-    Renvoie un objet Recording et un objet Sorting spikeinterface, a partir des fichiers neuroscope et klusters d'une session
+    Renvoie un objet Recording filtré et un objet Sorting spikeinterface, a partir des fichiers neuroscope et klusters d'une session
     """
     import probeinterface as pi
     from spikeinterface.extractors import read_neuroscope
-    import spikeinterface as si 
     from spikeinterface.preprocessing import bandpass_filter
 
     path_folder = root + f'Spike-sorting/Data_folders/{patient}/{patient}_stim{session}/'
@@ -472,10 +471,40 @@ def Rec_Sort_SI_remapped_filt_elec(patient, session, elec, clus, mapping_anat, d
     probe.set_device_channel_indices(np.arange(n_tetrodes * 4))
     recording = recording.set_probe(probe, in_place=False) # on associe le mapping au recording
     
-## 3) Re-construct periods outside deadperiods, for one electrode
-# For each electrode: rec + deadfile + re-mapped sorting + QM
+## 3) For one electrode: rec + sorting 
 
-# 3.A) utilitary functions:
+    # sous-sorting (unités dont group ∈ clus)
+    def select_units_by_group(sorting, groups):
+        groups = set(groups)
+        g = sorting.get_property("group")
+        unit_ids = [u for u, gg in zip(sorting.unit_ids, g) if int(gg) in groups]
+        return sorting.select_units(unit_ids)
+
+    sorting_elec = select_units_by_group(sorting, clus)
+
+    # sous-recording : canaux de l'electrode seulement
+    ch=[]
+    for tt in clus :
+        ch.append([str(tt*4-4), str(tt*4-3), str(tt*4-2), str(tt*4-1)])
+    ch = [x for xs in ch for x in xs] # on applatit la liste de listes en liste
+    recording_elec = recording.select_channels(ch) 
+    # filtre signal (300-3000 Hz)
+    recording_elec_f = bandpass_filter(recording=recording_elec, freq_min=300, freq_max=3000)
+
+    return recording_elec_f, sorting_elec
+
+
+def RecFiltered_Sort_SI_remapped_elec(patient, session, elec, clus, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
+    """
+    Re-construct periods outside dead periods, for one electrode: returns recording filtré et sorting re-mappés avec good chunks concaténés
+    """
+    import spikeinterface as si
+
+    recording_elec_f, sorting_e = RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root)
+
+    deadfile_elec = dict_elec2deadfile[elec]
+
+    # Utilitary functions:
     def load_dead_intervals_ts(deadfile_path: str, n_frames: int):
         """Depuis deadfile, retourne des intervalles bad (start,end) en frames int64, triés, mergés, clipés."""
         deadF = pd.read_csv(deadfile_path, sep="\t", header=None, names=["start", "end"])
@@ -540,42 +569,20 @@ def Rec_Sort_SI_remapped_filt_elec(patient, session, elec, clus, mapping_anat, d
 
         return si.NumpySorting.from_unit_dict(unit_dict, sampling_frequency=fs)
 
-    def select_units_by_group(sorting, groups):
-        groups = set(groups)
-        g = sorting.get_property("group")
-        unit_ids = [u for u, gg in zip(sorting.unit_ids, g) if int(gg) in groups]
-        return sorting.select_units(unit_ids)
-
-# 3.B) run for this electrode:
-    deadfile_elec = dict_elec2deadfile[elec]
-
-    # sous-sorting (unités dont group ∈ clus)
-    sorting_e = select_units_by_group(sorting, clus)
-
-    # sous-recording : canaux de l'electrode seulement
-    ch=[]
-    for tt in clus :
-        ch.append([str(tt*4-4), str(tt*4-3), str(tt*4-2), str(tt*4-1)])
-    ch = [x for xs in ch for x in xs] # on applatit la liste de listes en liste
-    recording_e = recording.select_channels(ch) 
-
     # recording concaténé selon deadfile
-    n = recording_e.get_num_frames()
+    n = recording_elec_f.get_num_frames()
     bad = load_dead_intervals_ts(deadfile_elec, n_frames=n)
     good_chunks = invert_intervals_to_good(bad, n_frames=n)
-    recording_e_clean = build_concat_recording(recording_e, good_chunks)
-
-    # filtre signal (300-3000 Hz) avant calcul des metriques
-    recording_elec_f = bandpass_filter(recording=recording_e_clean, freq_min=300, freq_max=3000)
+    recording_e_remapped = build_concat_recording(recording_elec_f, good_chunks)
 
     # remap spikes vers périodes concaténées
     sr = get_SR(patient)
-    sorting_clean = remap_sorting_to_concat(sorting_e, good_chunks, sr)
+    sorting_remapped = remap_sorting_to_concat(sorting_e, good_chunks, sr)
+    
+    return recording_e_remapped, sorting_remapped
 
-    return recording_elec_f, sorting_clean
 
-
-def quality_metrics_session(patient, session, elec, clus, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
+def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
     """
     Renvoie un tableau avec les quality metrics par unit. Besoin de Recording filtré et Sorting, sans les dead periods
     """
@@ -589,9 +596,9 @@ def quality_metrics_session(patient, session, elec, clus, mapping_anat, dict_ele
     mapping_anat["electrode"] = [tt[:-1] for tt in mapping_anat["tt"].tolist()] # depuis dgl2 renvoie dgl
     elec_to_clus = mapping_anat.groupby("electrode")["clu"].apply(lambda x: sorted(set(x.astype(int)))).to_dict()
 
-    for elec, clus in elec_to_clus.items():
-
-        recording_elec_f, sorting_clean = Rec_Sort_SI_remapped_filt_elec(patient, session, elec, clus, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/')
+    for _, clus in elec_to_clus.items():
+        # import d'un recordinf filtré et sorting re-mappés avec good chunks concaténés
+        recording_elec_f, sorting_clean = RecFiltered_Sort_SI_remapped_elec(patient, session, clus, mapping_anat, dict_elec2deadfile, root)
 
         if len(sorting_clean.unit_ids) == 0:
             continue
