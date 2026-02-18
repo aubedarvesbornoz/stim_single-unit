@@ -442,9 +442,9 @@ def is_in_ZEZIZPZLNI(patient, elec, plots):
 
 ############### Creation des tables de resultats par session ###############
 
-def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
+def Rec_Sort_SI_remapped_filt_elec(patient, session, elec, clus, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
     """
-    Renvoie un tableau avec les quality metrics par unit. Besoin des fichiers neuroscope et klusters
+    Renvoie un objet Recording et un objet Sorting spikeinterface, a partir des fichiers neuroscope et klusters d'une session
     """
     import probeinterface as pi
     from spikeinterface.extractors import read_neuroscope
@@ -452,8 +452,7 @@ def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, 
     from spikeinterface.preprocessing import bandpass_filter
 
     path_folder = root + f'Spike-sorting/Data_folders/{patient}/{patient}_stim{session}/'
-    list_col_qm = ['firing_rate', 'amplitude_median', 'num_spikes', 'presence_ratio', 'amplitude_cutoff' 'snr', 'isi_violations_ratio'] # liste des qm a garder
-
+    
 ## 1) Charger recording + sorting depuis neuroscope
     # (read_neuroscope suppose que les .res/.clu sont dans le même dossier que le .xml)
     xml_path = f"{path_folder}/{patient}_stim{session}.xml"  
@@ -473,17 +472,10 @@ def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, 
     probe.set_device_channel_indices(np.arange(n_tetrodes * 4))
     recording = recording.set_probe(probe, in_place=False) # on associe le mapping au recording
     
+## 3) Re-construct periods outside deadperiods, for one electrode
+# For each electrode: rec + deadfile + re-mapped sorting + QM
 
-## 3) Re-construct periods outside deadperiods, per electrode (pour calculer firing rate etc sur zones avec détection seulement)
-    # 3.A) Construct mapping electrode//tetrodes
-
-    mapping_anat["electrode"] = [tt[:-1] for tt in mapping_anat["tt"].tolist()] # depuis dgl1 renvoie dgl
-    # dict electrode -> liste des indices des tétrodes (clu)
-    elec_to_clus = mapping_anat.groupby("electrode")["clu"].apply(lambda x: sorted(set(x.astype(int)))).to_dict()
-
-    # 3.B) For each electrode: rec + deadfile + re-mapped sorting + QM
-
-        # 3.B.1) utilitary functions:
+# 3.A) utilitary functions:
     def load_dead_intervals_ts(deadfile_path: str, n_frames: int):
         """Depuis deadfile, retourne des intervalles bad (start,end) en frames int64, triés, mergés, clipés."""
         deadF = pd.read_csv(deadfile_path, sep="\t", header=None, names=["start", "end"])
@@ -554,36 +546,55 @@ def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, 
         unit_ids = [u for u, gg in zip(sorting.unit_ids, g) if int(gg) in groups]
         return sorting.select_units(unit_ids)
 
-        # 3.B.2) run per electrode:
+# 3.B) run for this electrode:
+    deadfile_elec = dict_elec2deadfile[elec]
+
+    # sous-sorting (unités dont group ∈ clus)
+    sorting_e = select_units_by_group(sorting, clus)
+
+    # sous-recording : canaux de l'electrode seulement
+    ch=[]
+    for tt in clus :
+        ch.append([str(tt*4-4), str(tt*4-3), str(tt*4-2), str(tt*4-1)])
+    ch = [x for xs in ch for x in xs] # on applatit la liste de listes en liste
+    recording_e = recording.select_channels(ch) 
+
+    # recording concaténé selon deadfile
+    n = recording_e.get_num_frames()
+    bad = load_dead_intervals_ts(deadfile_elec, n_frames=n)
+    good_chunks = invert_intervals_to_good(bad, n_frames=n)
+    recording_e_clean = build_concat_recording(recording_e, good_chunks)
+
+    # filtre signal (300-3000 Hz) avant calcul des metriques
+    recording_elec_f = bandpass_filter(recording=recording_e_clean, freq_min=300, freq_max=3000)
+
+    # remap spikes vers périodes concaténées
+    sr = get_SR(patient)
+    sorting_clean = remap_sorting_to_concat(sorting_e, good_chunks, sr)
+
+    return recording_elec_f, sorting_clean
+
+
+def quality_metrics_session(patient, session, elec, clus, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
+    """
+    Renvoie un tableau avec les quality metrics par unit. Besoin de Recording filtré et Sorting, sans les dead periods
+    """
+    import spikeinterface as si 
+
+    list_col_qm = ['firing_rate', 'amplitude_median', 'num_spikes', 'presence_ratio', 'amplitude_cutoff' 'snr', 'isi_violations_ratio'] # liste des qm a exporter
+
+## 1) run per electrode:
     all_qm = [] # ce sera une liste de dataframes de QM (un par electrode)
 
+    mapping_anat["electrode"] = [tt[:-1] for tt in mapping_anat["tt"].tolist()] # depuis dgl2 renvoie dgl
+    elec_to_clus = mapping_anat.groupby("electrode")["clu"].apply(lambda x: sorted(set(x.astype(int)))).to_dict()
+
     for elec, clus in elec_to_clus.items():
-        deadfile_elec = dict_elec2deadfile[elec]
 
-        # sous-sorting (unités dont group ∈ clus)
-        sorting_e = select_units_by_group(sorting, clus)
-        if len(sorting_e.unit_ids) == 0:
+        recording_elec_f, sorting_clean = Rec_Sort_SI_remapped_filt_elec(patient, session, elec, clus, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/')
+
+        if len(sorting_clean.unit_ids) == 0:
             continue
-
-        # sous-recording : canaux de l'electrode seulement
-        ch=[]
-        for tt in clus :
-            ch.append([str(tt*4-4), str(tt*4-3), str(tt*4-2), str(tt*4-1)])
-        ch = [x for xs in ch for x in xs] # on applatit la liste de listes en liste
-        recording_e = recording.select_channels(ch) 
-
-        # recording concaténé selon deadfile
-        n = recording_e.get_num_frames()
-        bad = load_dead_intervals_ts(deadfile_elec, n_frames=n)
-        good_chunks = invert_intervals_to_good(bad, n_frames=n)
-        recording_e_clean = build_concat_recording(recording_e, good_chunks)
-
-        # filtre signal (300-3000 Hz) avant calcul des metriques
-        recording_elec_f = bandpass_filter(recording=recording_e_clean, freq_min=300, freq_max=3000)
-
-        # remap spikes vers périodes concaténées
-        sr = get_SR(patient)
-        sorting_clean = remap_sorting_to_concat(sorting_e, good_chunks, sr)
 
         # analyzer + qm
         analyzer = si.create_sorting_analyzer(sorting_clean, recording_elec_f, format="memory", sparse=False)
@@ -595,7 +606,7 @@ def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, 
         qm = qm[list_col_qm]
         all_qm.append(qm)
 
-## 4) fusion des QM de toutes les electrodes
+## 2) fusion des QM de toutes les electrodes
     qm_all = pd.concat(all_qm, axis=0)
     
     return qm_all
