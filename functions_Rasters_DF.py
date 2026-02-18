@@ -452,6 +452,7 @@ def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, 
     from spikeinterface.preprocessing import bandpass_filter
 
     path_folder = root + f'Spike-sorting/Data_folders/{patient}/{patient}_stim{session}/'
+    list_col_qm = ['firing_rate', 'amplitude_median', 'num_spikes', 'presence_ratio', 'amplitude_cutoff' 'snr', 'isi_violations_ratio'] # liste des qm a garder
 
 ## 1) Charger recording + sorting depuis neuroscope
     # (read_neuroscope suppose que les .res/.clu sont dans le même dossier que le .xml)
@@ -591,7 +592,7 @@ def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, 
         analyzer.compute("templates")
         analyzer.compute("noise_levels")
         qm = analyzer.compute("quality_metrics").get_data()
-
+        qm = qm[list_col_qm]
         all_qm.append(qm)
 
 ## 4) fusion des QM de toutes les electrodes
