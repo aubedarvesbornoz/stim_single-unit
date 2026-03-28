@@ -363,7 +363,7 @@ def euclidian_distance(xyz_tt, xyz_stim,verb=False):
 
 ############### ZE ou hors ZE ###############
 
-def is_in_ZEZIZPZLNI(patient, elec, plots):
+def is_in_ZEZIZPZLNI(patient, elec, plots, root):
     '''
     Determine si une paire de plots est en ZE/ZI/ZP/ZL/Non-involved ou pas. Renvoie une liste de 5 bool.
     Args:
@@ -371,11 +371,10 @@ def is_in_ZEZIZPZLNI(patient, elec, plots):
         elec (str): nom de l'électrode macro
         plots (str): plots de l'électrode macro
     '''
-    DF_EZPZIZ = pd.read_excel('C:/Users/darves-bornoz/Documents/Data/ZeZiZpZl_23.10.25_anonyme.xlsx')
-    dict_index_zone = {'ZE':1, 'ZI':3, 'ZP':5, 'ZL':7} # indice de colonne avec electrodes de chaque zone
+    DF_EZPZIZ = pd.read_excel(root+'Spike-sorting/Tables/ZeZiZpZl.xlsx')
+    dict_index_zone = {'ZE':list(DF_EZPZIZ.columns).index('ZE_Electrode'), 'ZI':list(DF_EZPZIZ.columns).index('ZI_Electrode'), 'ZP':list(DF_EZPZIZ.columns).index('ZP_Electrode'), 'ZL':list(DF_EZPZIZ.columns).index('ZL_Electrode')} # indice de colonne avec electrodes de chaque zone
     dict_zone2boolean = {}
     elec = normalize_name(elec) # pour etre sur de pas passer acoté d'une elec si les nomenclaures diffèrent ('p' au lieu d'une apostrophe...)
-
     if patient in DF_EZPZIZ['Patient'].unique(): # si on a les ZE etc pour ce patient
         table_pat = DF_EZPZIZ[DF_EZPZIZ['Patient']==patient]
         for zone in dict_index_zone.keys() : 
@@ -436,13 +435,13 @@ def is_in_ZEZIZPZLNI(patient, elec, plots):
         for zone in dict_index_zone.keys() : 
             dict_zone2boolean[zone] = np.nan
         dict_zone2boolean['NI'] = np.nan
-
+    # print('end ZE',dict_zone2boolean)
     return list(dict_zone2boolean.values())
 
 
 ############### Creation des tables de resultats par session ###############
 
-def RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root='/media/aube/Aube/'):
+def RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root):
     """
     Renvoie un objet Recording filtré et un objet Sorting spikeinterface, a partir des fichiers neuroscope et klusters d'une session
     """
@@ -455,6 +454,7 @@ def RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root='/media/
 ## 1) Charger recording + sorting depuis neuroscope
     # (read_neuroscope suppose que les .res/.clu sont dans le même dossier que le .xml)
     xml_path = f"{path_folder}/{patient}_stim{session}.xml"  
+    print(xml_path)
     recording, sorting = read_neuroscope(xml_path, load_recording=True, load_sorting=True)
 
 ## 2) charger probe geometry
@@ -494,21 +494,21 @@ def RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root='/media/
     return recording_elec_f, sorting_elec
 
 
-def RecFiltered_Sort_SI_remapped_elec(patient, session, elec, clus, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
+def RecFiltered_Sort_SI_remapped_elec(patient, session, elec, clus, mapping_anat, dict_elec2deadfile, root):
     """
     Re-construct periods outside dead periods, for one electrode: returns recording filtré et sorting re-mappés avec good chunks concaténés
     """
     import spikeinterface as si
-
     recording_elec_f, sorting_e = RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root)
 
     deadfile_elec = dict_elec2deadfile[elec]
-
+    sr = get_SR(patient)
+    
     # Utilitary functions:
-    def load_dead_intervals_ts(deadfile_path: str, n_frames: int):
+    def load_dead_intervals_ts(deadF, n_frames):
         """Depuis deadfile, retourne des intervalles bad (start,end) en frames int64, triés, mergés, clipés."""
-        deadF = pd.read_csv(deadfile_path, sep="\t", header=None, names=["start", "end"])
-        bad = deadF[["start", "end"]].to_numpy(dtype=np.int64)
+        bad = np.rint(deadF[[0, 1]].to_numpy(dtype=float) * sr).astype(np.int64)
+        # bad = deadF[[0, 1]].to_numpy(dtype=np.int64)
         # tri + filtre
         bad = bad[np.argsort(bad[:, 0])]
         bad = bad[bad[:, 1] > bad[:, 0]]
@@ -576,41 +576,109 @@ def RecFiltered_Sort_SI_remapped_elec(patient, session, elec, clus, mapping_anat
     recording_e_remapped = build_concat_recording(recording_elec_f, good_chunks)
 
     # remap spikes vers périodes concaténées
-    sr = get_SR(patient)
     sorting_remapped = remap_sorting_to_concat(sorting_e, good_chunks, sr)
     
     return recording_e_remapped, sorting_remapped
 
 
-def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, root='/media/aube/Aube/'):
+def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, dict_clu2tt, root='/media/aube/Aube/'):
     """
-    Renvoie un tableau avec les quality metrics par unit. Besoin de Recording filtré et Sorting, sans les dead periods
+    Renvoie un tableau avec les quality metrics de SpikeInterface par unit. Besoin de Recording filtré et Sorting, re-mappé avec retrait des dead periods
+
+    Les quality metrics sont calculées électrode par électrode, sur :
+    - un recording déjà filtré
+    - un sorting déjà "remappé" après retrait / concaténation des dead periods
+
+    Paramètres
+    ----------
+    patient : str. Identifiant patient.
+    session : str. Identifiant de session.
+    mapping_anat : pd.DataFrame
+        Table de correspondance anatomique / électrodes. NB : la colonne `clu` de ce fichier désigne l'indice de tétrode dans le connect.
+    dict_elec2deadfile : dict
+        Dictionnaire electrode -> deadfile.
+        Ici les deadfiles sont utilisés par `RecFiltered_Sort_SI_remapped_elec`
+        pour reconstruire un recording/sorting sans périodes mortes.
+    dict_clu2tt : dict
+        Mapping : clu (ID neurone dans `spikes`) -> nom de tétrode (ex. 'vgc2')
+    root : str. Racine du projet.
+
+    Retour
+    ------
+    qm_all : pd.DataFrame
+        DataFrame concaténé pour toutes les électrodes.
+        L'index final de ce DataFrame est remappé sur les IDs `clu` de `spikes`, pour permettre ensuite un accès direct de type : qm.loc[clu, metric]
+
+    NB :
+    ----
+    Le remapping `qm.index -> clu_spikes` repose sur l'hypothèse suivante : à l'intérieur d'une même électrode, l'ordre des unités renvoyées par 
+    SpikeInterface (`sorting_clean.unit_ids` / `qm.index`) correspond à l'ordre des neurones dans `spikes` sur cette même électrode.
+    Si cette hypothèse devient fausse dans une future version du pipeline, l'appariement sera incorrect.
     """
     import spikeinterface as si 
 
-    list_col_qm = ['firing_rate', 'amplitude_median', 'num_spikes', 'presence_ratio', 'amplitude_cutoff' 'snr', 'isi_violations_ratio'] # liste des qm a exporter
+    list_col_qm = ['firing_rate', 'amplitude_median', 'num_spikes', 'presence_ratio', 'amplitude_cutoff', 'snr', 'isi_violations_ratio'] # liste des qm a exporter
 
 ## 1) run per electrode:
     all_qm = [] # ce sera une liste de dataframes de QM (un par electrode)
 
     mapping_anat["electrode"] = [tt[:-1] for tt in mapping_anat["tt"].tolist()] # depuis dgl2 renvoie dgl
-    elec_to_clus = mapping_anat.groupby("electrode")["clu"].apply(lambda x: sorted(set(x.astype(int)))).to_dict()
+    # Pour chaque électrode (ex. 'dtp', 'vgc', 'vof'), on récupère la liste des indices des tétrodes associés. Ex: 'dtp' -> [3, 4, 5]
+    elec_to_tt = mapping_anat.groupby("electrode")["clu"].apply(lambda x: sorted(set(x.astype(int)))).to_dict()
 
-    for _, clus in elec_to_clus.items():
-        # import d'un recordinf filtré et sorting re-mappés avec good chunks concaténés
-        recording_elec_f, sorting_clean = RecFiltered_Sort_SI_remapped_elec(patient, session, clus, mapping_anat, dict_elec2deadfile, root)
-
-        if len(sorting_clean.unit_ids) == 0:
+    for elec, ind_tt in elec_to_tt.items(): #  par ex. : dtp, [3, 4]
+        # import d'un rec_filtré et sorting re-mappés avec good chunks concaténés
+        recording_elec_f, sorting_clean = RecFiltered_Sort_SI_remapped_elec(patient, session, elec, ind_tt, mapping_anat, dict_elec2deadfile, root)
+        
+        if len(sorting_clean.unit_ids) == 0: # Si aucune unité n'est présente sur cette électrode, on passe à l'électrode suivante.
             continue
 
-        # analyzer + qm
+        # Construction du SortingAnalyzer SpikeInterface :
+        # format="memory" : toutes les données intermédiaires sont stockées en mémoire.
         analyzer = si.create_sorting_analyzer(sorting_clean, recording_elec_f, format="memory", sparse=False)
+        # Calculs nécessaires avant les quality metrics :
         analyzer.compute("random_spikes", method="uniform", max_spikes_per_unit=500, seed=0)
         analyzer.compute("waveforms", ms_before=1.0, ms_after=2.0, n_jobs=1)
         analyzer.compute("templates")
         analyzer.compute("noise_levels")
-        qm = analyzer.compute("quality_metrics").get_data()
+        
+        qm = analyzer.compute("quality_metrics").get_data() # Récupération du tableau de QM
         qm = qm[list_col_qm]
+
+        # -----------------------------
+        # Remapping des IDs d'unités
+        # -----------------------------
+        # `qm.index` correspond aux unit_ids de `sorting_clean`.
+        # Ces IDs ne correspondent pas directement aux IDs de neurones utilisés dans `spikes` / `dict_clu2tt`.
+        # On reconstruit donc un mapping par ordre, à l'intérieur de l'électrode.
+        # Liste des IDs `clu` (côté `spikes`) qui appartiennent à cette électrode.
+        # Exemple :
+        #   pour elec='vgc', récupérer tous les neurones dont dict_clu2tt[clu] est
+        #   'vgc1', 'vgc2', ou 'vgc3' -> après troncature tt[:-1] == 'vgc'
+
+        spikes_clu_this_elec = sorted([clu for clu, tt in dict_clu2tt.items() if tt[:-1] == elec]) # liste des clu sur l'electrode
+        qm_unit_ids = sorted(qm.index.tolist()) # unités présentes dans sorting_clean
+        # Vérification de cohérence :
+        # si le nombre d'unités n'est pas le même entre les neurones trouvés dans `spikes` VS les unités trouvées dans `qm`,
+        # alors on tronque par prudence à la plus petite longueur.
+        # Cela évite un crash, mais il peut y avoir ici une discordance réelle entre les deux représentations.
+        if len(spikes_clu_this_elec) != len(qm_unit_ids):
+            print(f"WARNING: mismatch on {elec}: {len(spikes_clu_this_elec)} neurones spikes vs {len(qm_unit_ids)} unités QM")
+            n = min(len(spikes_clu_this_elec), len(qm_unit_ids))
+            spikes_clu_this_elec = spikes_clu_this_elec[:n]
+            qm_unit_ids = qm_unit_ids[:n]
+            qm = qm.loc[qm_unit_ids].copy()
+
+        # mapping ordre par ordre : unit_id_qm -> clu_spikes
+        # Exemple :
+        #   qm_unit_ids         = [12, 14, 15]
+        #   spikes_clu_this_elec = [7, 8, 9]
+        #   => 12->7, 14->8, 15->9
+        dict_qm_to_spikes = dict(zip(qm_unit_ids, spikes_clu_this_elec))
+        # On garde explicitement la correspondance comme colonne informative :
+        qm["clu_spikes"] = [dict_qm_to_spikes[u] for u in qm.index]
+        # On remplace l'index par les IDs `clu` de `spikes`. Permettra plus tard de faire qm.loc[clu, metric]
+        qm.index = qm["clu_spikes"].values
         all_qm.append(qm)
 
 ## 2) fusion des QM de toutes les electrodes
@@ -620,62 +688,115 @@ def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, 
 
 
 def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, mpg, patient, session, root, mapping_anat, start_baseline=0, end_baseline=300, epsilon=0.1, verb=False, bin_z=0.05, bin_resp=[0.05, 0.075, 0.1]):
-    '''Cree un summary_session_df et general_session_df pour une session : summary_by_neuron et general_summary_by_neuron_and_stim
-    epsilon : valeur tres petite pour calculer le log-ratio
+    """
+    Construit deux tables de résumé pour une session :
+    1) summary_by_neuron
+       -> une ligne par neurone
+    2) summary_by_neuron_and_stim
+       -> une ligne par trial (neurone, stimulation)
 
-    '''
+    Contenu général
+    ---------------
+    Pour chaque neurone, on stocke :
+    - ses quality metrics
+    - son firing rate global
+    - son firing rate sur une baseline
+    - sa localisation anatomique et dans les zones ZE/ZI/ZP/ZL/NI
+
+    Pour chaque couple (neurone, stimulation), on ajoute aussi :
+    - firing rate pré-stim, post-stim
+    - variations relatives
+    - log-ratio
+    - z-score basé sur la période pré-stim
+    - modulation index
+    - distance stimulation / tétrode
+    - indicateurs binaires de réponse inhibitrice / excitatrice à plusieurs tailles de bins
+
+    Paramètres
+    ----------
+    spikes : TsGroup-like
+        Activité de tous les neurones de la session, avec temps de spikes (en s)
+    stims_loca : pd.DataFrame
+        Tableau des stimulations, contenant 't', 'durée', 'paramètres', 'electrode', 'plots', 'frequence', 'intensite', 'lobe'
+    dict_clu2tt : dict
+        Mapping :
+            clu (ID neurone dans spikes) -> nom de tétrade
+    dict_elec2deadfile : dict
+        Mapping : electrode -> deadfile
+    mpg : pd.DataFrame. Table d'information anatomique (tt, lobe, loca, etc.).
+    patient, session, root, mapping_anat :
+        Paramètres de contexte / I/O.
+    start_baseline, end_baseline : float
+        Bornes de la baseline en secondes.
+    epsilon : float
+        Petite constante pour stabiliser le calcul du log-ratio.
+    verb : bool
+        Passe à certaines fonctions auxiliaires de localisation.
+    bin_z : float
+        Taille des bins (en s) pour estimer le z-score pré-stim.
+    bin_resp : list[float]
+        Tailles de bins testées pour classifier les réponses (inhib/excit).
+
+    Retour
+    ------
+    (summary_df, general_df) : tuple[pd.DataFrame, pd.DataFrame]
+        - summary_df : une ligne par neurone
+        - general_df : une ligne par couple neurone x stimulation
+    """
+    # --------------
     # Initialisation
+    # --------------
     path_folder = root + f'Spike-sorting/Data_folders/{patient}/{patient}_stim{session}/'
     stimic_session='stimic'+session
     all_clu_ids = list(dict_clu2tt.keys()) # liste des indices de tous les neurones
     data, general_data = [], []
     labels_stims = stims_loca['paramètres'] # labels des stimulations
-    coord_MNI = pd.read_excel('C:/Users/darves-bornoz/Documents/Data/MNI_all_patients.xlsx')
+    coord_MNI = pd.read_excel(root+'Spike-sorting/Tables/MNI_all_patients.xlsx')
     coord_MNI_pat = coord_MNI[coord_MNI['Patient']==patient] # coordonnées MNI pour ce patient
 
     # variables pour obtenir dynamiques temporelles par U de temps
     pre_duration, post_duration = 10, 10  # sec
     
     # on charge les quality metrics de chaque SU de la session
-    qm = quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, root)
-    qm.reset_index()
+    list_col_qm = ['amplitude_median', 'num_spikes', 'presence_ratio', 'amplitude_cutoff', 'snr', 'isi_violations_ratio']
+    qm = quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, dict_clu2tt, root)[list_col_qm]
 
-    for ind_clu, clu in enumerate(all_clu_ids): # pour chaque neurone clu
+    for ind_clu, clu in enumerate(all_clu_ids): # pour chaque neurone
         
-        spk_times = spikes[clu].index.dropna().values  # Liste des t des spikes de ce neurone en sec
-        
+        spk_times = spikes[clu].index.values  # Liste des t des spikes de ce neurone en sec
         if len(spk_times) == 0: # si aucun spike, on passe au neurone suivant
             continue
         
-        # général :
+        # Initialisation de la ligne "par neurone" 
         row = {'patient': patient, 'session':stimic_session, 'clu': clu, 'tetrode': dict_clu2tt[clu],
                'lobe_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
                'loca_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0]} # Initialisation de la ligne de ce neurone
         
-        # quality metrics :
-        for metric in qm.columns.tolist():
-            row[metric] = qm.loc[ind_clu, metric]
+        # ajout des quality metrics :
+        if clu in list(qm.index):
+            for metric in list_col_qm:
+                row[metric] = qm.loc[clu, metric]
+        else:
+            for metric in list_col_qm:
+                row[metric] = np.nan
 
         # fr_global / Taux de décharge global :
         deadfile_elec = dict_elec2deadfile[dict_clu2tt[clu][:-1]]  # deadfile de l'electrode correspondante
         total_duration = get_total_duration(path_folder, patient, session, nb_channels(mapping_anat, patient, session, root)) - np.sum(deadfile_elec[1] - deadfile_elec[0]) # on soustrait deadperiods
         row['fr_global'] = len(spk_times) / (total_duration ) if total_duration > 0 else np.nan # nb de spikes / durée totale
-        # print('global: total_duration,dead,',total_duration,np.sum(deadfile_elec[1] - deadfile_elec[0]))
-
-        # fr_baseline / Taux de décharge sur une baseline des premières minutes (0 à 300s par défaut) :
+        
+        # fr_baseline / Taux de décharge sur une baseline des premières minutes (0 à 300s par défaut, baissé au début de la stim 1 si commence avant 300 s) :
+        if end_baseline > stims_loca.loc[0,'t']:
+            print('Attention, la baseline finit après le début de la première stim')
+            end_baseline = stims_loca.loc[0,'t']
         artefacts_filtered_baseline = deadfile_elec[(deadfile_elec[1] >= start_baseline) & (deadfile_elec[0] <= end_baseline)]
         dead_baseline = np.sum(np.minimum(artefacts_filtered_baseline[1], end_baseline) - np.maximum(artefacts_filtered_baseline[0], start_baseline))  
         spk_in_baseline = spk_times[spk_times <= end_baseline] # tous les spikes avant la fin de la baseline
         spk_in_baseline = spk_in_baseline[spk_in_baseline >= start_baseline] # tous les spikes après le début de la baseline
         row['fr_baseline'] = len(spk_in_baseline) / (end_baseline-start_baseline-dead_baseline) if (end_baseline-start_baseline-dead_baseline) > 0 else np.nan
-        # print('baseline: nb spikes, dead ', len(spk_in_baseline), dead_baseline)
-
-        # Responsiveness: est-ce que le clu repond a au moins une stim sur toute la session ? bool
-        responsive_clu = [False for _ in range(len(bin_resp))]
-        # inhib_only, excit_only, inhib_then_excit, excit_then_inhib = [], [], [], []
 
         # tt_in_ZE, etc 
-        ttZE, ttZI, ttZP, ttZL, ttNI = is_in_ZEZIZPZLNI(patient, dict_clu2tt[clu][:-1], find_back_macrocontacts_from_tt(normalize_name(dict_clu2tt[clu][:-1]), coord_MNI_pat,verb=verb)[1])
+        ttZE, ttZI, ttZP, ttZL, ttNI = is_in_ZEZIZPZLNI(patient, dict_clu2tt[clu][:-1], find_back_macrocontacts_from_tt(normalize_name(dict_clu2tt[clu][:-1]), coord_MNI_pat,verb=verb)[1], root)
         row['tt_en_ZE'],row['tt_en_ZI'],row['tt_en_ZP'],row['tt_en_ZL'],row['tt_en_NI'] = ttZE, ttZI, ttZP, ttZL, ttNI
             
         for i, stim in stims_loca.iterrows(): # Pour chaque stim:
@@ -694,9 +815,6 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             dead_post = np.sum(np.minimum(artefacts_filtered_post[1], t_post_end) - np.maximum(artefacts_filtered_post[0], t_post_start))  
             fr_pre = len(pre_spike_times) / (pre_duration - dead_pre) # les 10 sec sont diminuees avec quantité d'artefact dans deadfile
             fr_post = len(post_spike_times) / (post_duration - dead_post) # les 10 sec sont diminuees avec quantité d'artefact dans deadfile
-            # print('pre: nb spikes, pre_duration, dead_pre, pre_duration - dead_pre ',len(pre_spike_times), pre_duration, dead_pre, pre_duration - dead_pre)
-            # print('post: nb spikes, post_duration, dead_pre, post_duration - dead_post',len(post_spike_times), post_duration, dead_pre, post_duration - dead_post)
-
 
             # delta_pre_post, delta_baseline_post / % de variation :
             if fr_pre == 0:
@@ -712,7 +830,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             log_ratio = np.log((fr_post + epsilon) / (fr_pre + epsilon)) if fr_pre >= 0 else np.nan
             
             # Z-score pre : ( FRpost - mean_pre ) / std_pre
-            # attention ds vanderPlas prennent comme baseline la baseline de tous les trials
+            # attention dans vanderPlas prennent comme baseline la baseline de tous les trials
             if len(pre_spike_times) > 0:
                 bins = np.arange(t_pre_start, t_pre_end + bin_z, bin_z)
                 counts, _ = np.histogram(pre_spike_times, bins=bins)
@@ -733,87 +851,63 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             distance_tt_stim = euclidian_distance(xyz_tt, xyz_stim, verb=verb)
             
             # Stim en ZE, ZI, etc / Tetrode en ZE, ZI, etc :
-            stimZE, stimZI, stimZP, stimZL, stimNI = is_in_ZEZIZPZLNI(patient, stims_loca.loc[i, 'electrode'], stims_loca.loc[i, 'plots'])
+            stimZE, stimZI, stimZP, stimZL, stimNI = is_in_ZEZIZPZLNI(patient, stims_loca.loc[i, 'electrode'], stims_loca.loc[i, 'plots'], root)
             
-            # Stockage de ces variable dans data (summary_by_neuron)
-            label_stim = labels_stims[i][:-8]
-            row[f'{i}_{label_stim}_pre'] = fr_pre
-            row[f'{i}_{label_stim}_post'] = fr_post
-            row[f'{i}_{label_stim}_delta_pre_post'] = delta_pre_post
-            row[f'{i}_{label_stim}_delta_baseline_post'] = delta_baseline_post
-            row[f'{i}_{label_stim}_log_ratio'] = log_ratio
-            row[f'{i}_{label_stim}_zscore_pre'] = z_score_pre
-            row[f'{i}_{label_stim}_modulation_index'] = modulation_index
-            row[f'{i}_{label_stim}_distance_tt_stim'] = distance_tt_stim
-            row[f'{i}_{label_stim}_stim_en_ZE'],row[f'{i}_{label_stim}_stim_en_ZI'],row[f'{i}_{label_stim}_stim_en_ZP'],row[f'{i}_{label_stim}_stim_en_ZL'],row[f'{i}_{label_stim}_stim_en_NI'] = stimZE, stimZI, stimZP, stimZL, stimNI
-            
-            # Topographie : sameElec, sameLobe / Distance avec la stim / stim ou tt en ZE,ZI,ZP,ZL,NI 
-            row[f'{i}_{label_stim}_sameElec'] = electrodes_equal(dict_clu2tt[clu][:-1],stims_loca.loc[i,'electrode']) # localité du neurone par rapport aux stimulations
-            row[f'{i}_{label_stim}_sameLobe'] = (mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0] == stim['lobe'].strip())
-            
-            # et pour chaque stim et chaque neurone, on veut aussi une ligne entiere dans le df general_data
-            row_general = {'patient': patient, 'session':stimic_session, 'clu': clu, 'tetrode': dict_clu2tt[clu], 
-                           'lobe_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
-                            'loca_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0],
-                           'fr_global': row['fr_global'], 'fr_baseline': row['fr_baseline'],
-                           'delta_pre_post':delta_pre_post, 'delta_baseline_post':delta_baseline_post, 
-                           'fr_pre': fr_pre, 'fr_post': fr_post,  'log_ratio': log_ratio,
-                           'zscore_pre': z_score_pre, 'modulation_index': modulation_index, 
-                        #    'responsive_clu':responsive_clu, 'inhib_only': inhib_only, 'excit_only': excit_only, 
-                        #    'inhib_then_excit': inhib_then_excit, 'excit_then_inhib': excit_then_inhib, 
-                        #    'inhib_general': inhib_general, 'excit_general':excit_general, 
-                           'stim_Lobe': stim['lobe'].strip(), 'sameLobe': row[f'{i}_{label_stim}_sameLobe'], 'sameElec': row[f'{i}_{label_stim}_sameElec'],
-                            'freq_stim': int(stim['frequence'].strip()[:-3]), 'intensity_stim': float(stim['intensite'].strip()[:-3]), 
-                            'stim_in_ZE': stimZE, 'stim_in_ZI': stimZI, 'stim_in_ZP': stimZP, 'stim_in_ZL': stimZL, 'stim_in_NI': stimNI,
-                            'tt_in_ZE': ttZE, 'tt_in_ZI': ttZI, 'tt_in_ZP': ttZP, 'tt_in_ZL': ttZL, 'tt_in_NI': ttNI,
-                            'distance_tt_stim': distance_tt_stim}
+            # Stockage de ces variable dans general_data (summary_by_neuron_and_stim)
+            # avec une ligne entiere pour chaque stim et chaque neurone
+            row_general = {'patient': patient, 'session':stimic_session, 'clu': clu, 
+                        # infos sur tetrode :
+                        'tetrode': dict_clu2tt[clu], 'lobe_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
+                        'loca_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0],
+                        'tt_in_ZE': ttZE, 'tt_in_ZI': ttZI, 'tt_in_ZP': ttZP, 'tt_in_ZL': ttZL, 'tt_in_NI': ttNI,
+
+                        # infos sur stim :
+                        'stim_label':labels_stims[i][:-8], 'stim_Lobe': stim['lobe'].strip(), 
+                        'stim_in_ZE': stimZE, 'stim_in_ZI': stimZI, 'stim_in_ZP': stimZP, 'stim_in_ZL': stimZL, 'stim_in_NI': stimNI,
+                        'freq_stim': int(stim['frequence'].strip()[:-3]), 'intensity_stim': float(stim['intensite'].strip()[:-3]), 
+
+                        # Topographie : sameElec, sameLobe / Distance avec la stim / stim ou tt en ZE,ZI,ZP,ZL,NI 
+                        'sameElec': electrodes_equal(dict_clu2tt[clu][:-1],stims_loca.loc[i,'electrode']), # localité du neurone par rapport aux stimulations,
+                        'sameLobe': (mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0] == stim['lobe'].strip()), 
+                        'distance_tt_stim': distance_tt_stim, 
+
+                        # infos sur dynamique neuronale :
+                        'fr_global': row['fr_global'], 'fr_baseline': row['fr_baseline'],
+                        'delta_pre_post':delta_pre_post, 'delta_baseline_post':delta_baseline_post, 
+                        'fr_pre': fr_pre, 'fr_post': fr_post,  'log_ratio': log_ratio,
+                        'zscore_pre': z_score_pre, 'modulation_index': modulation_index}
             
             # quality metrics :
-            for metric in qm.columns.tolist():
-                row_general[metric] = qm.loc[ind_clu, metric]
-            
-            # Time binned to get AP per time unit
+            if clu in list(qm.index):
+                for metric in qm.columns.tolist():
+                    row_general[metric] = qm.loc[clu, metric]
+            else:
+                for metric in qm.columns.tolist():
+                    row_general[metric] = np.nan
+
+            # FR_pre(t), FR_post(t): pre_counts_i and post_counts_i with bin_r size = [0.05, 0.075, 0.1]
             for ind_bin, bin_r_i in enumerate(bin_resp):
                 bins_edges_i = np.arange(0, post_duration + bin_r_i, bin_r_i)
                 post_counts_i, _ = np.histogram(post_spike_times - t_post_start, bins=bins_edges_i)
                 pre_counts_i, _ = np.histogram(pre_spike_times - t_pre_start, bins=bins_edges_i)
             
-            # calcul seuil de depassement reponse significative : mean_pre +/- 2*std_pre
+            # Seuil de reponse significative : mean_pre +/- 2*std_pre
                 mean_pre = pre_counts_i.mean()
                 std_pre = pre_counts_i.std(ddof=1)
                 upper_thr = mean_pre + 2*std_pre
                 lower_thr = mean_pre - 2*std_pre
                 above = np.where(post_counts_i > upper_thr)[0] # depassement du seuil superieur
                 below = np.where(post_counts_i < lower_thr)[0] # depassement du seuil inferieur
-                # inhib_only = np.append(inhib_only, int(len(below) > 0 and len(above) == 0))
-                # excit_only = np.append(excit_only, int(len(above) > 0 and len(below) == 0))
-                # inhib_then_excit = np.append(inhib_then_excit, int(len(below) > 0 and len(above) > 0 and below[0] < above[0]))
-                # excit_then_inhib = np.append(excit_then_inhib, int(len(below) > 0 and len(above) > 0 and above[0] < below[0]))
-                # inhib_general = np.append(inhib_general, inhib_only[ind_bin] + inhib_then_excit[ind_bin])
-                # excit_general = np.append(excit_general, excit_only[ind_bin] + excit_then_inhib[ind_bin])
                 
-                # Ajout a data puis a data_general : 
-                row[f'{i}_{label_stim}_inhib_only_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) == 0) #inhib_only[ind_bin]
-                row[f'{i}_{label_stim}_excit_only_{bin_r_i}s_bins'] = int(len(above) > 0 and len(below) == 0) #excit_only[ind_bin]
-                row[f'{i}_{label_stim}_inhib_then_excit_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) > 0 and below[0] < above[0]) #inhib_then_excit[ind_bin]
-                row[f'{i}_{label_stim}_excit_then_inhib_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) > 0 and above[0] < below[0]) #excit_then_inhib[ind_bin]
-                row[f'{i}_{label_stim}_inhib_general_{bin_r_i}s_bins'] = row[f'{i}_{label_stim}_inhib_only_{bin_r_i}s_bins'] + row[f'{i}_{label_stim}_inhib_then_excit_{bin_r_i}s_bins'] + row[f'{i}_{label_stim}_excit_then_inhib_{bin_r_i}s_bins'] #inhib_general[ind_bin]
-                row[f'{i}_{label_stim}_excit_general_{bin_r_i}s_bins'] = row[f'{i}_{label_stim}_excit_only_{bin_r_i}s_bins'] + row[f'{i}_{label_stim}_inhib_then_excit_{bin_r_i}s_bins'] + row[f'{i}_{label_stim}_excit_then_inhib_{bin_r_i}s_bins'] #excit_general[ind_bin]
-                if row[f'{i}_{label_stim}_inhib_general_{bin_r_i}s_bins']>0 or row[f'{i}_{label_stim}_excit_general_{bin_r_i}s_bins']>0: # si une reponse a lieu, le clu est classé responsive, sinon il reste non-responsive par defaut
-                    responsive_clu[ind_bin] = True
+                row_general[f'inhib_only_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) == 0) 
+                row_general[f'excit_only_{bin_r_i}s_bins'] = int(len(above) > 0 and len(below) == 0) 
+                row_general[f'inhib_then_excit_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) > 0 and below[0] < above[0])
+                row_general[f'excit_then_inhib_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) > 0 and above[0] < below[0])
+                row_general[f'inhib_general_{bin_r_i}s_bins'] = row_general[f'inhib_only_{bin_r_i}s_bins'] + row_general[f'inhib_then_excit_{bin_r_i}s_bins'] + row_general[f'excit_then_inhib_{bin_r_i}s_bins']
+                row_general[f'excit_general_{bin_r_i}s_bins'] = row_general[f'excit_only_{bin_r_i}s_bins'] + row_general[f'inhib_then_excit_{bin_r_i}s_bins'] + row_general[f'excit_then_inhib_{bin_r_i}s_bins']
                 
-                row_general[f'inhib_only_{bin_r_i}s_bins'] = row[f'{i}_{label_stim}_inhib_only_{bin_r_i}s_bins']
-                row_general[f'excit_only_{bin_r_i}s_bins'] = row[f'{i}_{label_stim}_excit_only_{bin_r_i}s_bins']
-                row_general[f'inhib_then_excit_{bin_r_i}s_bins'] = row[f'{i}_{label_stim}_inhib_then_excit_{bin_r_i}s_bins']
-                row_general[f'excit_then_inhib_{bin_r_i}s_bins'] = row[f'{i}_{label_stim}_excit_then_inhib_{bin_r_i}s_bins']
-                row_general[f'inhib_general_{bin_r_i}s_bins'] = row[f'{i}_{label_stim}_inhib_general_{bin_r_i}s_bins']
-                row_general[f'excit_general_{bin_r_i}s_bins'] = row[f'{i}_{label_stim}_excit_general_{bin_r_i}s_bins']
-
             general_data.append(row_general) # une ligne par neurone et par stim
-        for ind_bin in range(len(bin_resp)):
-            row[f'responsive_clu_{bin_resp[ind_bin]}s_bins'] = responsive_clu[ind_bin]
-            # row_general.loc[-stims_loca.shape[0]:-1, f'responsive_clu_{bin_resp[ind_bin]}s_bins'] = [responsive_clu[ind_bin] for _ in range(stims_loca.shape[0])]
-        data.append(row) # une ligne par neurone
+            data.append(row) # une ligne par neurone
 
     return (pd.DataFrame(data), pd.DataFrame(general_data))
 
@@ -823,18 +917,21 @@ def create_or_update_session_summary(patient, session, start_baseline=0, end_bas
     Tourne pendant environ 30 sec/1 min par session. '''
     path_folder = root + 'Spike-sorting/Data_folders/'+patient+'/'+patient+'_stim'+session+'/'
     sr = get_SR(patient)
-    spikes = get_nwb(patient, session)
+    spikes = get_nwb(patient, session, root)
     stims_loca = get_stims(patient, session, root)
     mapping_anat = pd.read_csv(root + 'Spike-sorting/Data_folders/'+patient+'/mapping_anat_'+patient+'.txt', sep=',', engine='python')
     dict_elec2deadfile = get_dict_deadfiles(mapping_anat, patient, session, path_folder, sr)
     dict_clu2tt = get_dict_tetrodeName_from_tetrodeIndex(spikes, mapping_anat)
 
     # summary tables for the session:
-    summary_df, general_df = compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, mapping_anat, patient, session, root, mapping_anat, start_baseline=0, end_baseline=300, verb=verb, bin_z=bin_z, bin_resp=bin_resp)
-    summary_df.to_csv(path_folder+patient+'_stim'+session+"_summary_by_neuron.csv", index=False)
-    summary_df.to_excel(path_folder+patient+'_stim'+session+"_summary_by_neuron.xlsx", index=False)
-    general_df.to_csv(path_folder+patient+'_stim'+session+"_general_summary_by_neuron_and_stim.csv", index=False)
-    general_df.to_excel(path_folder+patient+'_stim'+session+"_general_summary_by_neuron_and_stim.xlsx", index=False)
+    tables_folder = root + 'Spike-sorting/Tables'+'/'
+    if not os.path.exists(tables_folder): # si le dossier de Tables n'existe pas encore, alors on le crée
+        os.makedirs(tables_folder)
+    summary_df, general_df = compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, mapping_anat, patient, session, root, mapping_anat, start_baseline, end_baseline, verb=verb, bin_z=bin_z, bin_resp=bin_resp)
+    summary_df.to_csv(tables_folder+patient+'_stim'+session+"_summary_by_neuron.csv", index=False)
+    summary_df.to_excel(tables_folder+patient+'_stim'+session+"_summary_by_neuron.xlsx", index=False)
+    general_df.to_csv(tables_folder+patient+'_stim'+session+"_general_summary_by_neuron_and_stim.csv", index=False)
+    general_df.to_excel(tables_folder+patient+'_stim'+session+"_general_summary_by_neuron_and_stim.xlsx", index=False)
     print('Summary tables saved')
 
     return summary_df, general_df
