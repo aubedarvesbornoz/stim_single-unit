@@ -51,7 +51,7 @@ def get_nwb(patient, session, root='D:/'):
     path_folder = root + 'Spike-sorting/Data_folders/'+patient+'/'+patient+'_stim'+session+'/'
     files_basename = patient+'_stim'+session
     nwbfile_path = path_folder + files_basename + ".nwb"
-    print(path_folder)
+    print(path_folder, 'existe?', os.path.exists(nwbfile_path))
     if not os.path.exists(nwbfile_path): # creation du nwb s'il n'existe pas encore
         from datetime import datetime
         from dateutil import tz
@@ -935,7 +935,102 @@ def update_general_summary_on_all_sessions(root='D:/'):
 # Raster display functions
 ##################################################
 
-def plot_artefact_patches(ax, deadfile, stim_start, line_index, duration_out_array, side='pre', type_raster='one_neuron', stim_duration=None, window=10, color='black', alpha=0.3, display=True):
+def _interval_overlap_length(a_start, a_end, b_start, b_end):
+    return max(0, min(a_end, b_end) - max(a_start, b_start))
+
+def _compute_binned_rates_and_wilcoxon(
+    pre_spikes_rel,
+    post_spikes_rel,
+    stim_start,
+    stim_end,
+    deadfile_elec,
+    bin_size=0.1,              # 100 ms conseillé comme défaut
+    window=10,
+    min_valid_bin_frac=0.8     # on garde le bin si au moins 80% du bin est exploitable
+):
+    """
+    pre_spikes_rel : spikes pré, en temps relatifs à stim_start, donc entre -window et 0
+    post_spikes_rel : spikes post, en temps relatifs à stim_end, donc entre 0 et +window
+    stim_start, stim_end : temps absolus
+    deadfile_elec : array-like Nx2 avec [start, end] en temps absolus
+    """
+    deadfile_elec = np.asarray(deadfile_elec) # df to array
+    pre_spikes_rel = np.asarray(pre_spikes_rel)
+    post_spikes_rel = np.asarray(post_spikes_rel)
+
+    from scipy.stats import wilcoxon
+    edges = np.arange(0, window + bin_size, bin_size)
+    n_bins = len(edges) - 1
+
+    pre_rates = []
+    post_rates = []
+
+    pre_spikes_rel = np.asarray(pre_spikes_rel)
+    post_spikes_rel = np.asarray(post_spikes_rel)
+
+    for k in range(n_bins):
+        # bornes relatives
+        pre_rel_start = -window + k * bin_size
+        pre_rel_end   = pre_rel_start + bin_size
+
+        post_rel_start = k * bin_size
+        post_rel_end   = post_rel_start + bin_size
+
+        # bornes absolues
+        pre_abs_start = stim_start + pre_rel_start
+        pre_abs_end   = stim_start + pre_rel_end
+
+        post_abs_start = stim_end + post_rel_start
+        post_abs_end   = stim_end + post_rel_end
+
+        # durée valide du bin pré
+        removed_pre = 0.0
+        artefacts_pre = deadfile_elec[
+            (deadfile_elec[:, 1] > pre_abs_start) & (deadfile_elec[:, 0] < pre_abs_end)
+        ]
+        for a0, a1 in artefacts_pre:
+            removed_pre += _interval_overlap_length(pre_abs_start, pre_abs_end, a0, a1)
+        valid_pre = bin_size - removed_pre
+
+        # durée valide du bin post
+        removed_post = 0.0
+        artefacts_post = deadfile_elec[
+            (deadfile_elec[:, 1] > post_abs_start) & (deadfile_elec[:, 0] < post_abs_end)
+        ]
+        for a0, a1 in artefacts_post:
+            removed_post += _interval_overlap_length(post_abs_start, post_abs_end, a0, a1)
+        valid_post = bin_size - removed_post
+
+        # on ne garde que les bins suffisamment exploitables des deux côtés
+        if valid_pre < min_valid_bin_frac * bin_size or valid_post < min_valid_bin_frac * bin_size:
+            continue
+
+        # comptage des spikes dans le bin
+        n_pre = np.sum((pre_spikes_rel >= pre_rel_start) & (pre_spikes_rel < pre_rel_end))
+        n_post = np.sum((post_spikes_rel >= post_rel_start) & (post_spikes_rel < post_rel_end))
+
+        # conversion en taux (Hz)
+        pre_rates.append(n_pre / valid_pre)
+        post_rates.append(n_post / valid_post)
+
+    pre_rates = np.asarray(pre_rates)
+    post_rates = np.asarray(post_rates)
+
+    # pas assez de bins valides
+    if len(pre_rates) < 5:
+        return np.nan, np.nan, len(pre_rates), pre_rates, post_rates
+
+    # Wilcoxon échoue si toutes les différences sont nulles
+    if np.allclose(pre_rates - post_rates, 0):
+        return np.nan, 1.0, len(pre_rates), pre_rates, post_rates
+    try:
+        stat, pval = wilcoxon(pre_rates, post_rates, zero_method='pratt', alternative='two-sided')
+    except ValueError:
+        stat, pval = np.nan, np.nan
+    return stat, pval, len(pre_rates), pre_rates, post_rates
+
+def plot_artefact_patches(ax, deadfile, stim_start, line_index, duration_out_array, side='pre', time_mode='relative', 
+                          stim_duration=None, window=10, color='black', alpha=0.15, display=True):
     """
     Dessine un patch d'artefact sur l'axe donné.
     Args:
@@ -945,7 +1040,7 @@ def plot_artefact_patches(ax, deadfile, stim_start, line_index, duration_out_arr
         line_index (int): Position verticale (ligne raster) du neurone ou de la stimulation.
         duration_out_array (np.array): Tableau accumulant la durée supprimée pour le neurone.
         side (str): 'pre' ou 'post'.
-        type_raster (str): Si 'one_neuron', centre la période autour de 0 (soustrait stim_start aux temps). Si 'one_stim' on ne change rien, car les temps restent bruts, ne sont pas relatifs.
+        time_mode (str): Si 'relative', centre la période autour de 0 (soustrait stim_start aux temps). Si 'absolute' on ne change rien, car les temps restent bruts, ne sont pas relatifs.
         stim_duration (float): Durée de la stimulation, nécessaire pour les cas post-stim alignés.
         window (float): Durée de la fenêtre avant ou après la stimulation (en secondes).
         color (str): Couleur du patch.
@@ -973,27 +1068,23 @@ def plot_artefact_patches(ax, deadfile, stim_start, line_index, duration_out_arr
                     display_start = artefact_start_clipped - stim_duration  
                 else:
                     display_start = artefact_start_clipped # a gauche/pre-stim: on prend la valeur brute de debut artefact ou debut window
-                if type_raster == 'one_neuron': # on décale parce que qd on plot pr ttes les stims, l'absisse est centrée sur le début de la stimulation (-10 à +10 s)
+                if time_mode == 'relative': # on décale parce que qd on plot pr ttes les stims, l'absisse est centrée sur le début de la stimulation (-10 à +10 s)
                     display_start -= stim_start
                 rect = plt.Rectangle((display_start, line_index - 0.23), width, 0.5,
                                     color=color, alpha=alpha, edgecolor='none')
                 ax.add_patch(rect)
 
 
-def rasters_OneNeuron_allStims(patient, session, spikes, stims, dict_clu2tt, dict_elec2deadfile, path_folder, display_patches = True, plafond_inhib_100 = True):
+def rasters_OneNeuron_allStims(patient, session, spikes, stims, dict_clu2tt, dict_elec2deadfile, path_rasters, display_patches = True, plafond_inhib_100 = True):
     '''
     Returns and saves one raster per neuron, for all the EBS of the session. Runs on all neurons of the recording.
     Args:
         display_patches = True # si on veut afficher les patches gris des dead periods
         plafond_inhib_100 = True # si on veut que la variation de fréquence de décharge soit plafonnée à 100% qd inhibition (sinon, on change le calcul de % variation)
     '''
-    print('in raster')
-    if not os.path.exists(Path(path_folder+"\Rasters")): # on cree le dossier "Rasters" pour stock images s'il n'existe pas encore
-        os.makedirs(Path(path_folder+"\Rasters"))
+    from matplotlib.transforms import blended_transform_factory
 
     for ind_neuron in range(len(spikes)):
-        print('in neuron ',ind_neuron)
-        # ind_neuron=0
         deadfile_elec = dict_elec2deadfile[dict_clu2tt[ind_neuron][:-1]]  # deadfile de l'electrode correspondante
         spike_times_before = [] # on veut une liste par epoch
         spike_times_after = []
@@ -1027,8 +1118,8 @@ def rasters_OneNeuron_allStims(patient, session, spikes, stims, dict_clu2tt, dic
 
         # 1.bis. Ajout des periodes qui sont dans le deadfile :
         durationOut_preStim, durationOut_postStim = np.zeros(stims.shape[0]), np.zeros(stims.shape[0]) # duree cumulee par neurone qui a ete retiree
+        wilcoxon_pvals, wilcoxon_labels, wilcoxon_nbins = [], [], []
         for ind_stim in range(stims.shape[0]):
-            print('in stim',ind_stim)
             stim_start = stims['t'][ind_stim]
             stim_end = stims['t + durée'][ind_stim]
             # on met d'abord a jour la somme des periodes enlevées sur ce trial
@@ -1037,8 +1128,40 @@ def rasters_OneNeuron_allStims(patient, session, spikes, stims, dict_clu2tt, dic
             durationOut_preStim[ind_stim] = np.sum(np.minimum(artefacts_filtered_pre[1], stim_start) - np.maximum(artefacts_filtered_pre[0], stim_start-10)) 
             durationOut_postStim[ind_stim] = np.sum(np.minimum(artefacts_filtered_post[1], stim_end+10) - np.maximum(artefacts_filtered_post[0], stim_end))  
             # puis on affiche les dead periods
-            plot_artefact_patches(ax1, deadfile_elec, stim_start, ind_stim, durationOut_preStim, side='pre', type_raster='one_neuron', display=display_patches)
-            plot_artefact_patches(ax1, deadfile_elec, stim_start, ind_stim, durationOut_postStim, side='post', type_raster='one_neuron', stim_duration=stims['durée'][ind_stim], display=display_patches)
+            plot_artefact_patches(ax1, deadfile_elec, stim_start, ind_stim, durationOut_preStim, side='pre', time_mode='relative', display=display_patches)
+            plot_artefact_patches(ax1, deadfile_elec, stim_start, ind_stim, durationOut_postStim, side='post', time_mode='relative', stim_duration=stims['durée'][ind_stim], display=display_patches)
+
+            # Ajout Wilcoxon pré vs post par bins, pour chaque stimulation
+            stat, pval, n_bins_used, pre_rates, post_rates = _compute_binned_rates_and_wilcoxon(
+                pre_spikes_rel=spike_times_before[ind_stim],   # temps relatifs à stim_start
+                post_spikes_rel=spike_times_after[ind_stim],   # temps relatifs à stim_end
+                stim_start=stim_start,
+                stim_end=stim_end,
+                deadfile_elec=deadfile_elec,
+                bin_size=0.1,          # 100 ms ; mets 0.05 si tu veux tester 50 ms
+                window=10,
+                min_valid_bin_frac=0.8)
+            wilcoxon_pvals.append(pval)
+            wilcoxon_nbins.append(n_bins_used)
+            if np.isnan(pval):
+                label = "NA"
+            elif pval < 0.001:
+                label = "***"
+            elif pval < 0.01:
+                label = "**"
+            elif pval < 0.05:
+                label = "*"
+            else:
+                label = ""#"ns"
+            wilcoxon_labels.append(label)
+        # modif couleur des ylabels selon résultat stat
+        yticklabels = ax1.get_yticklabels()
+        for i, label in enumerate(yticklabels):
+            pval = wilcoxon_pvals[i]
+            if not np.isnan(pval) and pval < 0.05:
+                label.set_color('black')
+            else:
+                label.set_color('gray')
 
         # 2. variation de fréquence de décharge, > ou < 0
         if plafond_inhib_100:
@@ -1059,11 +1182,35 @@ def rasters_OneNeuron_allStims(patient, session, spikes, stims, dict_clu2tt, dic
                         firing_rate_var[i] = 100 * ((len(spike_times_after[i]) / (10 - durationOut_postStim[i])) - (len(spike_times_before[i]) / (10 - durationOut_preStim[i]))) / (len(spike_times_before[i]) / (10 - durationOut_preStim[i]))
                 else:
                     firing_rate_var[i] = np.nan
-        ax2.barh([str(i) for i in range(stims.shape[0])], firing_rate_var, color='orange')
+        # couleur de variation variable selon wilcoxon significatif ou pas (orange foncé ou clair)
+        colors_var_wilcoxon = []
+        for pval in wilcoxon_pvals:
+            if np.isnan(pval):
+                colors_var_wilcoxon.append('lightgray')  # option pour NA
+            elif pval < 0.05:
+                colors_var_wilcoxon.append('orange')     # jaune foncé (actuel)
+            else:
+                colors_var_wilcoxon.append("#E4CEA3")    # jaune clair
+
+        ypos = np.arange(stims.shape[0])
+        ax2.barh(ypos, firing_rate_var, color=colors_var_wilcoxon)
         ax2.axvline(0, linewidth=1, color="black")
         ax2.set_ylim(-1, stims.shape[0])
-        ax2.set_yticks(list(range(stims.shape[0])), [' ' for s in stim_names])
+        ax2.set_yticks(ypos)
+        ax2.set_yticklabels([' ' for _ in stim_names])
+
         ax2.set_xlabel("Variation of firing rate:\nafter-before EBS (in %)", fontsize=12)
+        # affichage du Wilcoxon 
+        trans = blended_transform_factory(ax1.transAxes, ax1.transData) # a mettre en argument du text a ajouter pour que les coordonnées soient dans le referentiel de ax1 plutot
+        for i, (lab, pval, nb) in enumerate(zip(wilcoxon_labels, wilcoxon_pvals, wilcoxon_nbins)):
+            txt = "NA" if np.isnan(pval) else lab
+            ax2.text(
+                1.02, ypos[i]-0.2, txt,
+                transform=trans,
+                va='center',
+                ha='left',
+                fontsize=9,
+                clip_on=False)
 
         # 3. nombre de spikes par unité de temps
         nb_time_bins=100
@@ -1075,137 +1222,243 @@ def rasters_OneNeuron_allStims(patient, session, spikes, stims, dict_clu2tt, dic
         ax4.set_xlabel("Time before the start (s)                              Time after the end (s)", fontsize=12)
         ax4.set_ylabel("Number of\nspikes per\ntime unit", fontsize=12)
 
-        plt.subplots_adjust(hspace=0.05, wspace=0.05)
-        plt.savefig(path_folder+"/Rasters/Raster - all stimulations for neuron "+str(ind_neuron)+" from "+dict_clu2tt[ind_neuron]+".png", dpi=300)
+        plt.subplots_adjust(hspace=0.05, wspace=0.1)        
+        patch_title = '' if display_patches else '_noDead'
+        plt.savefig(path_rasters + "Raster - all stimus for unit "+str(ind_neuron)+" from "+dict_clu2tt[ind_neuron]+patch_title+".png", dpi=300)
         plt.show()
 
 
-def rasters_OneStim_allNeurons(patient, session, spikes, stims, dict_clu2tt, dict_elec2deadfile, path_folder, display_patches = True, plafond_inhib_100 = True):
+def rasters_OneStim_allNeurons(patient, session, spikes, stims, dict_clu2tt, dict_elec2deadfile, path_rasters, display_patches=True, plafond_inhib_100=True):
+    from matplotlib.transforms import blended_transform_factory
 
-    if not os.path.exists(Path(path_folder+"/Rasters")):
-        os.makedirs(Path(path_folder+"/Rasters"))
-
-    # D'abord determiner si certaines stims avec mm caracs/mm label exactement => car besoin 
-    # si label identique a autres: ajout suffixe _1, _2,... au fichier exporté / ‘_’+i for i in range(nb de fois que repet)
-    list_suffix_stim_rep = ['' for _ in range(stims.shape[0])] # par défaut, suffixe vide
+    # D'abord determiner si certaines stims avec mm caracs/mm label exactement
+    list_suffix_stim_rep = ['' for _ in range(stims.shape[0])]
     for s in np.unique(stims['paramètres'].tolist()):
-        if stims['paramètres'].tolist().count(s) > 1 : # si au moins 2 stims avec meme label
-            list_ind_stim_repeated = [i for i, x in enumerate(stims['paramètres'].tolist()) if x == s]  # liste des indices de stims avec ce label
+        if stims['paramètres'].tolist().count(s) > 1:
+            list_ind_stim_repeated = [i for i, x in enumerate(stims['paramètres'].tolist()) if x == s]
             for ind_stim_rep in list_ind_stim_repeated:
                 list_suffix_stim_rep[ind_stim_rep] = '_' + str(ind_stim_rep + 1)
 
     for ind_stim in range(stims.shape[0]):
-        stim_start, stim_end = stims['t'][ind_stim], stims['t + durée'][ind_stim]
-        epoch_test = nap.IntervalSet(start=[stim_start-10, stim_end], end=[stim_start, stim_end+10], time_units="s") # df avec debut/fin de chaque epoch
+        stim_start = stims['t'][ind_stim]
+        stim_end = stims['t + durée'][ind_stim]
 
-        spikes_restricted = spikes.restrict(epoch_test) # activité totale sur ces epochs seulement
-        spike_times = [spikes_restricted[nrn].index for nrn in dict_clu2tt.keys()] # liste de listes : temps de décharge pour chaque neurone, dans un ordre tel que fourni ds mapping 
+        epoch_test = nap.IntervalSet(
+            start=[stim_start-10, stim_end],
+            end=[stim_start, stim_end+10],
+            time_units="s"
+        )
+
+        spikes_restricted = spikes.restrict(epoch_test)
+
+        # liste des spikes pour chaque neurone
+        spike_times = [spikes_restricted[nrn].index for nrn in dict_clu2tt.keys()]
         spike_times_before, spike_times_after = [], []
+
         for spike_times_i in spike_times:
-            spike_times_before.append([t for t in spike_times_i if t<=stim_start])
-            spike_times_after.append([t-stims['durée'][ind_stim] for t in spike_times_i if t>stim_start])
+            # temps relatifs: pre vs stim_start, post vs stim_end
+            spike_times_before.append([t - stim_start for t in spike_times_i if t <= stim_start])
+            spike_times_after.append([t - stim_end for t in spike_times_i if t > stim_start])
 
         # affichage general
-        fig = plt.figure(figsize=(15, max(4, int(len(spikes)/4)))) # grille de sous-graphiques 1x3
+        fig = plt.figure(figsize=(15, max(4, int(len(spikes)/4))))
         gs = gridspec.GridSpec(2, 2, width_ratios=[4, 1], height_ratios=[4, 1])
         plt.style.use('ggplot')
-        stim_title = stims['electrode'][ind_stim]+' '+stims['plots'][ind_stim]+', at '+stims['frequence'][ind_stim]+' and '+stims['intensite'][ind_stim]
-        fig.suptitle(patient+", stimic"+session+": all neurons when stimulating in "+stim_title, fontsize=14, y=0.95)
-        ax1 = plt.subplot(gs[0,0])
-        ax2 = plt.subplot(gs[0,1])
-        ax4 = plt.subplot(gs[1,0])
+
+        stim_title = stims['electrode'][ind_stim] + ' ' + stims['plots'][ind_stim] + ', at ' + stims['frequence'][ind_stim] + ' and ' + stims['intensite'][ind_stim]
+        fig.suptitle(patient + ", stimic" + session + ": all neurons when stimulating in " + stim_title, fontsize=14, y=0.95)
+
+        ax1 = plt.subplot(gs[0, 0])
+        ax2 = plt.subplot(gs[0, 1])
+        ax4 = plt.subplot(gs[1, 0])
 
         # 1. raster plot for the specific stimulation
         ax1.eventplot(spike_times_before, colors="green", linelengths=0.5)
-        ax1.axvline(stim_start, color="blue", linestyle="-", linewidth=1, label="Stimulation")
+        ax1.axvline(0, color="blue", linestyle="-", linewidth=1, label="Stimulation end-aligned comparison")
         ax1.eventplot(spike_times_after, colors="red", linelengths=0.5)
-        ax1.set_xlim([stim_start-10, stim_start+10])
-        x = np.arange(-10,11,1)
-        ax1.set_xticks([stim_start+x_i for x_i in x], np.repeat(' ', len(x)))
-        ax1.set_ylim(-2, len(spikes.index)+1)
-        ax1.set_yticks(range(0,len(spikes.index)), dict_clu2tt.values()) # selon nombre total de nrn pour cette session
+        ax1.set_xlim([-10, 10])
+
+        x = np.arange(-10, 11, 1)
+        ax1.set_xticks(x, np.repeat(' ', len(x)))
+        ax1.set_ylim(-2, len(spikes.index) + 1)
+        ax1.set_yticks(range(0, len(spikes.index)))
+        ax1.set_yticklabels(list(dict_clu2tt.values()))
         ax1.set_ylabel("Neuron per tetrode")
 
-        # 1.bis. Ajout des periodes qui sont dans le deadfile :
-        durationOut_preStim, durationOut_postStim = np.zeros(len(spikes.index)), np.zeros(len(spikes.index)) # duree cumulee par neurone qui a ete retiree
+        # 1.bis. dead periods + Wilcoxon
+        durationOut_preStim = np.zeros(len(spikes.index))
+        durationOut_postStim = np.zeros(len(spikes.index))
+        wilcoxon_pvals, wilcoxon_labels, wilcoxon_nbins = [], [], []
+
         for ind_ligne_raster, tt in enumerate(dict_clu2tt.values()):
             deadfile_elec = dict_elec2deadfile[tt[:-1]]
-            # on met d'abord a jour la somme des periodes enlevées sur ce trial
+
             artefacts_filtered_pre = deadfile_elec[(deadfile_elec[1] >= stim_start-10) & (deadfile_elec[0] <= stim_start)]
             artefacts_filtered_post = deadfile_elec[(deadfile_elec[1] >= stim_end) & (deadfile_elec[0] <= stim_end+10)]
-            durationOut_preStim[ind_ligne_raster] = np.sum(np.minimum(artefacts_filtered_pre[1], stim_start) - np.maximum(artefacts_filtered_pre[0], stim_start-10)) 
-            durationOut_postStim[ind_ligne_raster] = np.sum(np.minimum(artefacts_filtered_post[1], stim_end+10) - np.maximum(artefacts_filtered_post[0], stim_end))  
-            # puis on affiche les dead periods
-            plot_artefact_patches(ax1, deadfile_elec, stim_start, ind_ligne_raster, durationOut_preStim, side='pre', type_raster='one_stim', display=display_patches)
-            plot_artefact_patches(ax1, deadfile_elec, stim_start, ind_ligne_raster, durationOut_postStim, side='post', type_raster='one_stim', stim_duration=stims['durée'][ind_stim], display=display_patches)
 
-        # 2. variation de fréquence de décharge, > ou < 0 (corrigee par les portions de temps dans deadfile)
+            durationOut_preStim[ind_ligne_raster] = np.sum(
+                np.minimum(artefacts_filtered_pre[1], stim_start) - np.maximum(artefacts_filtered_pre[0], stim_start-10))
+            durationOut_postStim[ind_ligne_raster] = np.sum(
+                np.minimum(artefacts_filtered_post[1], stim_end+10) - np.maximum(artefacts_filtered_post[0], stim_end))
+
+            plot_artefact_patches(
+                ax1, deadfile_elec, stim_start, ind_ligne_raster,
+                durationOut_preStim, side='pre', time_mode='relative',
+                display=display_patches)
+            plot_artefact_patches(
+                ax1, deadfile_elec, stim_start, ind_ligne_raster,
+                durationOut_postStim, side='post', time_mode='relative',
+                stim_duration=stims['durée'][ind_stim], display=display_patches)
+
+            # Wilcoxon par neurone
+            stat, pval, n_bins_used, pre_rates, post_rates = _compute_binned_rates_and_wilcoxon(
+                pre_spikes_rel=spike_times_before[ind_ligne_raster],
+                post_spikes_rel=spike_times_after[ind_ligne_raster],
+                stim_start=stim_start,
+                stim_end=stim_end,
+                deadfile_elec=deadfile_elec,
+                bin_size=0.1,
+                window=10,
+                min_valid_bin_frac=0.8)
+
+            wilcoxon_pvals.append(pval)
+            wilcoxon_nbins.append(n_bins_used)
+
+            if np.isnan(pval):
+                label = "NA"
+            elif pval < 0.001:
+                label = "***"
+            elif pval < 0.01:
+                label = "**"
+            elif pval < 0.05:
+                label = "*"
+            else:
+                label = ""
+
+            wilcoxon_labels.append(label)
+        # couleur noms de tetrode sur ax1
+        yticklabels = ax1.get_yticklabels()
+        for i, label in enumerate(yticklabels):
+            pval = wilcoxon_pvals[i]
+            if not np.isnan(pval) and pval < 0.05:
+                label.set_color('black')
+            else:
+                label.set_color('gray')
+
+        # 2. variation de fréquence de décharge
         if plafond_inhib_100:
-            firing_rate_var = [100*(len(spike_times_after[i])/(10-durationOut_postStim[i])-len(spike_times_before[i])/(10-durationOut_preStim[i]))/(len(spike_times_before[i])/(10-durationOut_preStim[i])) for i in range(len(spikes.index))] 
+            firing_rate_var = [
+                100 * (
+                    (len(spike_times_after[i]) / (10 - durationOut_postStim[i])) -
+                    (len(spike_times_before[i]) / (10 - durationOut_preStim[i]))
+                ) / (len(spike_times_before[i]) / (10 - durationOut_preStim[i]))
+                if len(spike_times_before[i]) > 0 else np.nan
+                for i in range(len(spikes.index))
+            ]
         else:
-            firing_rate_var = [np.nan for i in range(stims.shape[0])]
-            for i in range(len(spikes.index)) :
+            firing_rate_var = [np.nan for _ in range(len(spikes.index))]
+            for i in range(len(spikes.index)):
                 if len(spike_times_before[i]) > 0:
-                    if (len(spike_times_after[i]) / (10 - durationOut_postStim[i])) < (len(spike_times_before[i]) / (10 - durationOut_preStim[i])) : 
+                    pre_rate = len(spike_times_before[i]) / (10 - durationOut_preStim[i])
+                    post_rate = len(spike_times_after[i]) / (10 - durationOut_postStim[i])
+
+                    if post_rate < pre_rate:
                         if len(spike_times_after[i]) > 0:
-                            firing_rate_var[i] =  - 100 * ((len(spike_times_before[i]) / (10 - durationOut_preStim[i])) - (len(spike_times_after[i]) / (10 - durationOut_postStim[i]))) / (len(spike_times_after[i]) / (10 - durationOut_postStim[i]))
+                            firing_rate_var[i] = -100 * (pre_rate - post_rate) / post_rate
                         else:
                             firing_rate_var[i] = np.nan
                     else:
-                        firing_rate_var[i] = 100 * ((len(spike_times_after[i]) / (10 - durationOut_postStim[i])) - (len(spike_times_before[i]) / (10 - durationOut_preStim[i]))) / (len(spike_times_before[i]) / (10 - durationOut_preStim[i]))
+                        firing_rate_var[i] = 100 * (post_rate - pre_rate) / pre_rate
                 else:
-                    firing_rate_var[i] = np.nan    
-        ax2.barh([str(i) for i in range(len(spikes.index))], firing_rate_var, color='orange') 
+                    firing_rate_var[i] = np.nan
+
+        # couleur selon significativité du Wilcoxon
+        colors_var_wilcoxon = []
+        for pval in wilcoxon_pvals:
+            if np.isnan(pval):
+                colors_var_wilcoxon.append('lightgray')
+            elif pval < 0.05:
+                colors_var_wilcoxon.append('orange')
+            else:
+                colors_var_wilcoxon.append("#E4CEA3")
+
+        ypos = np.arange(len(spikes.index))
+        ax2.barh(ypos, firing_rate_var, color=colors_var_wilcoxon)
         ax2.axvline(0, linewidth=1, color="black")
-        ax2.set_ylim(-2, len(spikes.index)+1)
-        ax2.set_yticks(range(0,len(spikes.index)), np.repeat('', len(spikes.index)))
+        ax2.set_ylim(-2, len(spikes.index) + 1)
+        ax2.set_yticks(ypos)
+        ax2.set_yticklabels(np.repeat('', len(spikes.index)))
         ax2.set_xlabel("Variation of firing rate:\nafter-before EBS (in %)", fontsize=10)
 
+        # affichage du Wilcoxon entre ax1 et ax2
+        trans = blended_transform_factory(ax1.transAxes, ax1.transData)
+        for i, (lab, pval, nb) in enumerate(zip(wilcoxon_labels, wilcoxon_pvals, wilcoxon_nbins)):
+            txt = "NA" if np.isnan(pval) else lab
+            ax2.text(
+                1.02, ypos[i] - 0.2, txt,
+                transform=trans,
+                va='center',
+                ha='left',
+                fontsize=9,
+                clip_on=False
+            )
+
         # 3. nombre de spikes par unité de temps
-        nb_time_bins=100
+        nb_time_bins = 100
         ax4.hist(np.sort([item for sublist in spike_times_before for item in sublist]), nb_time_bins, color='green')
-        ax4.axvline(stim_start, color="blue", linestyle="-", linewidth=1, label="Stimulation")
+        ax4.axvline(0, color="blue", linestyle="-", linewidth=1, label="Stimulation")
         ax4.hist(np.sort([item for sublist in spike_times_after for item in sublist]), nb_time_bins, color='red')
-        ax4.set_xlim([stim_start-10, stim_start+10])
-        ax4.set_xticks([stim_start+x_i for x_i in x], x)
-        ax4.set_xlabel("Time before the start (s)                                               Time after the end (s)", fontsize=10)
+        ax4.set_xlim([-10, 10])
+        ax4.set_xticks(x)
+        ax4.set_xlabel("Time before the start (s)                              Time after the end (s)", fontsize=10)
         ax4.set_ylabel("Number of spikes\nper time unit", fontsize=10)
 
-        plt.subplots_adjust(hspace=0.05, wspace=0.15)
-        patch_title = ['' if display_patches else '_noDeadPeriods'][0]
-        title_fig = path_folder+"/Rasters/Raster - all neurons for stim "+stims['electrode'][ind_stim]+' '+stims['plots'][ind_stim]+', at '+stims['frequence'][ind_stim]+', '+stims['intensite'][ind_stim]+patch_title+".png"
+        plt.subplots_adjust(hspace=0.05, wspace=0.1)
+
+        patch_title = '' if display_patches else '_noDead'
+        title_fig = (
+            path_rasters + "Raster - all units for stim " +
+            stims['electrode'][ind_stim] + ' ' + stims['plots'][ind_stim] +
+            ', at ' + stims['frequence'][ind_stim] + ', ' + stims['intensite'][ind_stim] +
+            patch_title + ".png")
         plt.savefig(title_fig, dpi=300)
-
         plt.show()
-
 
 def create_or_update_rasters(patient, session, overwrite_rasters=True, root='D:/'):
     '''
     Cree tous les rasters pour une session
     overwrite_rasters = False si les rasters ont déjà été faits
+    disp = True pour afficher les zones artéfactées
     '''
     path_folder = root + 'Spike-sorting/Data_folders/'+patient+'/'+patient+'_stim'+session+'/'
+    rasters_folder_artefacts = root + 'Spike-sorting/Rasters'+'/'+patient+'_stim'+session+'/'
+    rasters_folder_NoArtefacts = root + 'Spike-sorting/Rasters_noPatch'+'/'+patient+'_stim'+session+'/'
+    disp_patch = [True, False] # affichage patches artefacts pour rasters_folder_artefacts et rasters_folder_NoArtefacts
 
     sr = get_SR(patient)
-    spikes = get_nwb(patient, session)
+    spikes = get_nwb(patient, session, root)
 
     stims_loca = get_stims(patient, session, root)
     mapping_anat = pd.read_csv(root + 'Spike-sorting/Data_folders/'+patient+'/mapping_anat_'+patient+'.txt', sep=',', engine='python')
 
     dict_elec2deadfile = get_dict_deadfiles(mapping_anat, patient, session, path_folder, sr)
     dict_clu2tt = get_dict_tetrodeName_from_tetrodeIndex(spikes, mapping_anat)
-
-    # rasters: 
-    if os.path.exists(path_folder+"/Rasters"): 
-        if overwrite_rasters :
-            if os.listdir(Path(path_folder+"/Rasters")) != []: # si deja fichiers 
-                for f in os.listdir(Path(path_folder+"/Rasters")): # alors on efface tous les fichiers du dossier Rasters
-                    Path(path_folder+"/Rasters"+'/'+f).unlink()
-                rasters_OneNeuron_allStims(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_folder, display_patches = True, plafond_inhib_100 = True)
-                rasters_OneStim_allNeurons(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_folder, display_patches = True, plafond_inhib_100 = True)
-    else:
-        rasters_OneNeuron_allStims(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_folder, display_patches = True, plafond_inhib_100 = True)
-        rasters_OneStim_allNeurons(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_folder, display_patches = True, plafond_inhib_100 = True)
+    
+    for ind, rasters_folder in enumerate([rasters_folder_artefacts, rasters_folder_NoArtefacts]):
+        if not os.path.exists(rasters_folder): # si le dossier de Rasters n'existe pas encore, alors on le crée
+            os.makedirs(rasters_folder)
+        folder_is_empty = (len(os.listdir(rasters_folder)) == 0) # True si dossier Rasters vide, False sinon (pour savoir si on efface des fichiers ou pas)
+        if folder_is_empty:
+            rasters_OneNeuron_allStims(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_rasters=rasters_folder, display_patches = disp_patch[ind], plafond_inhib_100 = True)
+            rasters_OneStim_allNeurons(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_rasters=rasters_folder, display_patches = disp_patch[ind], plafond_inhib_100 = True)
+        else: # folder deja rempli
+            if overwrite_rasters: # il y a bien des fichiers, on les supprime d'abord 
+                for f in os.listdir(rasters_folder):
+                    Path(rasters_folder + '/' + f).unlink()
+                rasters_OneNeuron_allStims(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_rasters=rasters_folder, display_patches = disp_patch[ind], plafond_inhib_100 = True)
+                rasters_OneStim_allNeurons(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_rasters=rasters_folder, display_patches = disp_patch[ind], plafond_inhib_100 = True)
+            else:
+                print('rasters already exist and overwrite_rasters=False')
 
 ##################################################
 # Signal display functions
@@ -1217,7 +1470,6 @@ def load_eeg(eegfname, nCh, order = 'F', dtype = np.int16):
     """
     size = get_total_duration(eegfname, nCh, np.int16)
     lfps = np.memmap(eegfname, mode='r', dtype=dtype, order=order, shape=(nCh, int(size/nCh)))
-    
     return lfps 
 
 def get_tickLocsNLabels_centered(tickMin, tickMax, nTicks, dtype = float, conversion = 1): # called in plot_chTraces()
