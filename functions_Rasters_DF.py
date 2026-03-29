@@ -961,9 +961,10 @@ def update_general_summary_on_all_sessions(root='D:/'):
     path_tables = Path(root, "Spike-sorting/Tables")
     
     all_summaries_trials, all_summaries_nrn = [], [] # Liste de DF, pour stocker tous les csv, qui seront concaténés
+
     path_summaries_trials = path_tables.rglob("*general_summary_by_neuron_and_stim.csv")
     path_summaries_nrn = path_tables.rglob("*_summary_by_neuron.csv")
-
+    
     for path in path_summaries_trials:
         df_summary_trials = pd.read_csv(path)
         # On crée une colonne 'global_clu' unique pour s'y retrouver dans l'indexation de l'ensemble des neurones
