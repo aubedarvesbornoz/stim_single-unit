@@ -725,6 +725,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
     - z-score basé sur la période pré-stim
     - modulation index
     - distance stimulation / tétrode
+    - effets cognitifs s'ils sont renseignés
     - indicateurs binaires de réponse inhibitrice / excitatrice à plusieurs tailles de bins
 
     Paramètres
@@ -774,6 +775,17 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
     # on charge les quality metrics de chaque SU de la session
     list_col_qm = ['amplitude_median', 'num_spikes', 'presence_ratio', 'amplitude_cutoff', 'snr', 'isi_violations_ratio']
     qm = quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, dict_clu2tt, root)[list_col_qm]
+
+    # --- Chargement éventuel d'un fichier de stim avec colonne cognitive ("cog") ---
+    # Ce fichier, s'il existe, est supposé correspondre ligne à ligne à stims_loca
+    # avec une colonne supplémentaire 'cog' en fin de table.
+    path_cog = (path_folder + f"{patient}_stim{session}_stim_events_TRC_re-shifted_loca_COG.txt")
+    if os.path.exists(path_cog):
+        stims_with_cog = pd.read_csv(path_cog, sep=';')
+        if 'cog' in stims_with_cog.columns:
+            cog_by_stim = stims_with_cog['cog'].apply(lambda x: np.nan if pd.isna(x) or str(x).strip() == '' else ast.literal_eval(x))
+        else:
+            print(f"⚠️ Fichier COG trouvé mais sans colonne 'cog' : {path_cog}")
 
     for _, clu in enumerate(all_clu_ids): # pour chaque neurone
         
@@ -891,6 +903,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                         'stim_Lobe': stim_Lobe, 'stim_Lobe_noLat' : remove_laterality(stim_Lobe),
                         'stim_in_ZE': stimZE, 'stim_in_ZI': stimZI, 'stim_in_ZP': stimZP, 'stim_in_ZL': stimZL, 'stim_in_NI': stimNI,
                         'freq_stim': int(stim['frequence'].strip()[:-3]), 'intensity_stim': float(stim['intensite'].strip()[:-3]), 
+                        'cog': cog_by_stim.loc[i],
 
                         # Topographie : sameElec, sameLobe / Distance avec la stim / stim ou tt en ZE,ZI,ZP,ZL,NI 
                         'sameElec': sameElec, 'sameLobe': sameLobe, 
