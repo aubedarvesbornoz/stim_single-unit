@@ -761,29 +761,31 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
     list_col_qm = ['amplitude_median', 'num_spikes', 'presence_ratio', 'amplitude_cutoff', 'snr', 'isi_violations_ratio']
     qm = quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, dict_clu2tt, root)[list_col_qm]
 
-    for ind_clu, clu in enumerate(all_clu_ids): # pour chaque neurone
+    for _, clu in enumerate(all_clu_ids): # pour chaque neurone
         
         spk_times = spikes[clu].index.values  # Liste des t des spikes de ce neurone en sec
         if len(spk_times) == 0: # si aucun spike, on passe au neurone suivant
             continue
         
         # Initialisation de la ligne "par neurone" 
-        row = {'patient': patient, 'session':stimic_session, 'clu': clu, 'tetrode': dict_clu2tt[clu],
-               'lobe_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
-               'loca_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0]} # Initialisation de la ligne de ce neurone
+        row_unit = {'patient': patient, 'session':stimic_session, 'clu': clu, 'tetrode': dict_clu2tt[clu],
+                    'lobe_tt' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
+                    'loca_tt' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0],
+                    'lobe_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].str[2:],
+                    'loca_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].str[2:]} # Initialisation de la ligne de ce neurone
         
         # ajout des quality metrics :
         if clu in list(qm.index):
             for metric in list_col_qm:
-                row[metric] = qm.loc[clu, metric]
+                row_unit[metric] = qm.loc[clu, metric]
         else:
             for metric in list_col_qm:
-                row[metric] = np.nan
+                row_unit[metric] = np.nan
 
         # fr_global / Taux de décharge global :
         deadfile_elec = dict_elec2deadfile[dict_clu2tt[clu][:-1]]  # deadfile de l'electrode correspondante
         total_duration = get_total_duration(path_folder, patient, session, nb_channels(mapping_anat, patient, session, root)) - np.sum(deadfile_elec[1] - deadfile_elec[0]) # on soustrait deadperiods
-        row['fr_global'] = len(spk_times) / (total_duration ) if total_duration > 0 else np.nan # nb de spikes / durée totale
+        row_unit['fr_global'] = len(spk_times) / (total_duration ) if total_duration > 0 else np.nan # nb de spikes / durée totale
         
         # fr_baseline / Taux de décharge sur une baseline des premières minutes (0 à 300s par défaut, baissé au début de la stim 1 si commence avant 300 s) :
         if end_baseline > stims_loca.loc[0,'t']:
@@ -793,11 +795,11 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
         dead_baseline = np.sum(np.minimum(artefacts_filtered_baseline[1], end_baseline) - np.maximum(artefacts_filtered_baseline[0], start_baseline))  
         spk_in_baseline = spk_times[spk_times <= end_baseline] # tous les spikes avant la fin de la baseline
         spk_in_baseline = spk_in_baseline[spk_in_baseline >= start_baseline] # tous les spikes après le début de la baseline
-        row['fr_baseline'] = len(spk_in_baseline) / (end_baseline-start_baseline-dead_baseline) if (end_baseline-start_baseline-dead_baseline) > 0 else np.nan
+        row_unit['fr_baseline'] = len(spk_in_baseline) / (end_baseline-start_baseline-dead_baseline) if (end_baseline-start_baseline-dead_baseline) > 0 else np.nan
 
         # tt_in_ZE, etc 
         ttZE, ttZI, ttZP, ttZL, ttNI = is_in_ZEZIZPZLNI(patient, dict_clu2tt[clu][:-1], find_back_macrocontacts_from_tt(normalize_name(dict_clu2tt[clu][:-1]), coord_MNI_pat,verb=verb)[1], root)
-        row['tt_en_ZE'],row['tt_en_ZI'],row['tt_en_ZP'],row['tt_en_ZL'],row['tt_en_NI'] = ttZE, ttZI, ttZP, ttZL, ttNI
+        row_unit['tt_en_ZE'],row_unit['tt_en_ZI'],row_unit['tt_en_ZP'],row_unit['tt_en_ZL'],row_unit['tt_en_NI'] = ttZE, ttZI, ttZP, ttZL, ttNI
             
         for i, stim in stims_loca.iterrows(): # Pour chaque stim:
             
@@ -821,10 +823,10 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                 delta_pre_post = np.nan
             else:
                 delta_pre_post = 100 * (fr_post - fr_pre) / fr_pre
-            if row['fr_baseline'] == 0:
+            if row_unit['fr_baseline'] == 0:
                 delta_baseline_post = np.nan
             else:  
-                delta_baseline_post = 100 * (fr_post - row['fr_baseline']) / row['fr_baseline']
+                delta_baseline_post = 100 * (fr_post - row_unit['fr_baseline']) / row_unit['fr_baseline']
             
             # Log-ratio : variation symétrique (hausse/diminution comparables). epsilon pr eviter division par 0
             log_ratio = np.log((fr_post + epsilon) / (fr_pre + epsilon)) if fr_pre >= 0 else np.nan
@@ -855,14 +857,18 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             
             # Stockage de ces variable dans general_data (summary_by_neuron_and_stim)
             # avec une ligne entiere pour chaque stim et chaque neurone
-            row_general = {'patient': patient, 'session':stimic_session, 'clu': clu, 
+            row_trial = {'patient': patient, 'session':stimic_session, 'clu': clu, 
                         # infos sur tetrode :
-                        'tetrode': dict_clu2tt[clu], 'lobe_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
+                        'tetrode': dict_clu2tt[clu], 
+                        'lobe_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
                         'loca_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0],
+                        'lobe_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].str[2:],
+                        'loca_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].str[2:],
                         'tt_in_ZE': ttZE, 'tt_in_ZI': ttZI, 'tt_in_ZP': ttZP, 'tt_in_ZL': ttZL, 'tt_in_NI': ttNI,
 
                         # infos sur stim :
-                        'stim_label':labels_stims[i][:-8], 'stim_Lobe': stim['lobe'].strip(), 
+                        'stim_label':labels_stims[i][:-8], 'ind_stim' : i,
+                        'stim_Lobe': stim['lobe'].strip(), 'stim_Lobe_noLat' : row_trial['stim_Lobe'].str[2:],
                         'stim_in_ZE': stimZE, 'stim_in_ZI': stimZI, 'stim_in_ZP': stimZP, 'stim_in_ZL': stimZL, 'stim_in_NI': stimNI,
                         'freq_stim': int(stim['frequence'].strip()[:-3]), 'intensity_stim': float(stim['intensite'].strip()[:-3]), 
 
@@ -872,7 +878,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                         'distance_tt_stim': distance_tt_stim, 
 
                         # infos sur dynamique neuronale :
-                        'fr_global': row['fr_global'], 'fr_baseline': row['fr_baseline'],
+                        'fr_global': row_unit['fr_global'], 'fr_baseline': row_unit['fr_baseline'],
                         'delta_pre_post':delta_pre_post, 'delta_baseline_post':delta_baseline_post, 
                         'fr_pre': fr_pre, 'fr_post': fr_post,  'log_ratio': log_ratio,
                         'zscore_pre': z_score_pre, 'modulation_index': modulation_index}
@@ -880,10 +886,10 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             # quality metrics :
             if clu in list(qm.index):
                 for metric in qm.columns.tolist():
-                    row_general[metric] = qm.loc[clu, metric]
+                    row_trial[metric] = qm.loc[clu, metric]
             else:
                 for metric in qm.columns.tolist():
-                    row_general[metric] = np.nan
+                    row_trial[metric] = np.nan
 
             # FR_pre(t), FR_post(t): pre_counts_i and post_counts_i with bin_r size = [0.05, 0.075, 0.1]
             for ind_bin, bin_r_i in enumerate(bin_resp):
@@ -899,15 +905,15 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                 above = np.where(post_counts_i > upper_thr)[0] # depassement du seuil superieur
                 below = np.where(post_counts_i < lower_thr)[0] # depassement du seuil inferieur
                 
-                row_general[f'inhib_only_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) == 0) 
-                row_general[f'excit_only_{bin_r_i}s_bins'] = int(len(above) > 0 and len(below) == 0) 
-                row_general[f'inhib_then_excit_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) > 0 and below[0] < above[0])
-                row_general[f'excit_then_inhib_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) > 0 and above[0] < below[0])
-                row_general[f'inhib_general_{bin_r_i}s_bins'] = row_general[f'inhib_only_{bin_r_i}s_bins'] + row_general[f'inhib_then_excit_{bin_r_i}s_bins'] + row_general[f'excit_then_inhib_{bin_r_i}s_bins']
-                row_general[f'excit_general_{bin_r_i}s_bins'] = row_general[f'excit_only_{bin_r_i}s_bins'] + row_general[f'inhib_then_excit_{bin_r_i}s_bins'] + row_general[f'excit_then_inhib_{bin_r_i}s_bins']
-                
-            general_data.append(row_general) # une ligne par neurone et par stim
-            data.append(row) # une ligne par neurone
+                row_trial[f'inhib_only_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) == 0) 
+                row_trial[f'excit_only_{bin_r_i}s_bins'] = int(len(above) > 0 and len(below) == 0) 
+                row_trial[f'inhib_then_excit_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) > 0 and below[0] < above[0])
+                row_trial[f'excit_then_inhib_{bin_r_i}s_bins'] = int(len(below) > 0 and len(above) > 0 and above[0] < below[0])
+                row_trial[f'inhib_general_{bin_r_i}s_bins'] = row_trial[f'inhib_only_{bin_r_i}s_bins'] + row_trial[f'inhib_then_excit_{bin_r_i}s_bins'] + row_trial[f'excit_then_inhib_{bin_r_i}s_bins']
+                row_trial[f'excit_general_{bin_r_i}s_bins'] = row_trial[f'excit_only_{bin_r_i}s_bins'] + row_trial[f'inhib_then_excit_{bin_r_i}s_bins'] + row_trial[f'excit_then_inhib_{bin_r_i}s_bins']
+
+            general_data.append(row_trial) # une ligne par neurone et par stim
+            data.append(row_unit) # une ligne par neurone
 
     return (pd.DataFrame(data), pd.DataFrame(general_data))
 
@@ -946,19 +952,19 @@ def update_all_existing_session_summaries(root='D:/', verb=False, bin_z=0.05, bi
             patient = relative.parts[0]
             session = relative.parts[1]
             print('Update started for ', session)
-            _,_  = create_or_update_session_summary(patient, session[-1], start_baseline=0, end_baseline=300, root=root, verb=verb, bin_z=bin_z, bin_resp=bin_resp)
+            _,_  = create_or_update_session_summary(patient, session[-1], root=root, verb=verb, bin_z=bin_z, bin_resp=bin_resp)
             print('Update done for ', session)
 
 
 ############### Big dataframe functions ###############
 
 def update_general_summary_on_all_sessions(root='D:/'):
-    '''Tourne sur tous les session_summaries et recrée et renvoie big_df
+    '''Identifie les sessions avec un nwb, tourne sur tous les session_summaries et recrée et renvoie big_df
     Tourne eviron 40 sec pour une vingtaine de sessions.'''
     base = Path(root, "Spike-sorting/Data_folders")
     
     nwb_files = []
-    all_gen_summaries, all_summaries_by_nrn, all_stims = [], [], [] # Liste de DF, pour stocker tous les csv
+    all_gen_summaries, all_summaries_by_nrn = [], [], []  # Liste de DF, pour stocker tous les csv
 
     for path in base.rglob("*.nwb"): # pour chaque session traitée, donc pour laquelle on a un .nwb :
         relative = path.relative_to(base) # On garde les fichiers qui sont exactement à 2 niveaux sous le dossier racine
@@ -973,7 +979,6 @@ def update_general_summary_on_all_sessions(root='D:/'):
 
             if gen_summary_path.exists():
                 # on récupère general_summary (par neurone et par stimulation)
-                # print(f"existe: {gen_summary_path}")
                 general_summary = pd.read_csv(gen_summary_path)
                 # On crée une colonne 'global_clu' unique pour s'y retrouver dans l'indexation de l'ensemble des neurones
                 general_summary["patient"] = patient
@@ -991,39 +996,17 @@ def update_general_summary_on_all_sessions(root='D:/'):
                     stims_loca = pd.read_csv(base / patient / session / f"{session}_stim_events_TRC_re-shifted_loca.txt", header=None)
                 else:
                     stims_loca = pd.read_csv(base / patient / session / f"{session}_stim_events_TRC_shifted_loca.txt", header=None)
-                all_stims.append(stims_loca)
 
     # Empile tous les DataFrames de type summary
     big_df = pd.concat(all_gen_summaries, ignore_index=True)
     big_df_by_nrn = pd.concat(all_summaries_by_nrn, ignore_index=True)
-    big_df_stims = pd.concat(all_stims, ignore_index=True)
-    big_df_stims.columns = ["label", "t_start", "duration", "lobe"]
-
-    # Ajout de qqs colonnes utiles: stim_Lobe_noLat, lobe_tt_noLat, ind_stim (intra-session)
-    big_df['stim_Lobe_noLat'] = big_df['stim_Lobe'].str[2:]
-    big_df['lobe_tt_noLat'] = big_df['lobe_tt'].str[2:]
-    big_df['loca_tt_noLat'] = big_df['loca_tt'].str[2:]
-    list_stim_indices = np.zeros(big_df.shape[0])
-    ind_trial = 0
-    for p in big_df['patient'].unique().tolist():
-        for sess in big_df[big_df['patient']==p]['session'].unique().tolist():
-            df_session = big_df[big_df['patient']==p][big_df[big_df['patient']==p]['session']==sess]
-            nb_stims = int(big_df[big_df['session']==sess].shape[0]/len(big_df[big_df['session']==sess]['clu'].unique())) # normalement, tombe pile sur un entier
-            for _ in df_session['clu'].unique():
-                for ind_stim in range(nb_stims):
-                    list_stim_indices[ind_trial] = int(ind_stim)
-                    ind_trial += 1
-    big_df['ind_stim'] = list_stim_indices
 
     # Export des dataframes generaux
-    big_df.to_excel("C:/Users/darves-bornoz/Documents/article_neuronal_stimic/stats/general_summary_all_sessions.xlsx", index=False)
-    big_df.to_csv("C:/Users/darves-bornoz/Documents/article_neuronal_stimic/stats/general_summary_all_sessions.csv", index=False)
+    big_df.to_excel(root+"Spike-sorting/Tables/general_summary_all_sessions.xlsx", index=False)
+    big_df.to_csv(root+"Spike-sorting/Tables/general_summary_all_sessions.csv", index=False)
     
-    big_df_by_nrn.to_excel("C:/Users/darves-bornoz/Documents/article_neuronal_stimic/stats/summary_by_nrn_all_sessions.xlsx", index=False)
-    big_df_by_nrn.to_csv("C:/Users/darves-bornoz/Documents/article_neuronal_stimic/stats/summary_by_nrn_all_sessions.csv", index=False)
-    
-    # big_df_stims.to_excel("C:/Users/darves-bornoz/Documents/article_neuronal_stimic/stats/stims_all_sessions.xlsx", index=False)
-    # big_df_stims.to_csv("C:/Users/darves-bornoz/Documents/article_neuronal_stimic/stats/stims_all_sessions.csv", index=False)
+    big_df_by_nrn.to_excel(root+"Spike-sorting/Tables/summary_by_nrn_all_sessions.xlsx", index=False)
+    big_df_by_nrn.to_csv(root+"Spike-sorting/Tables/summary_by_nrn_all_sessions.csv", index=False)
     
     return big_df
 
