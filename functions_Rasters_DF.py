@@ -1304,20 +1304,22 @@ def rasters_OneNeuron_allStims(patient, session, spikes, stims, dict_clu2tt, dic
 
         plt.subplots_adjust(hspace=0.05, wspace=0.1)        
         patch_title = '' if display_patches else '_noDead'
-        plt.savefig(path_rasters + "Raster - all stimus for unit "+str(ind_neuron)+" from "+dict_clu2tt[ind_neuron]+patch_title+".png", dpi=300)
+        plt.savefig(path_rasters + "Raster - all stims for unit "+str(ind_neuron)+" from "+dict_clu2tt[ind_neuron]+patch_title+".png", dpi=300)
         plt.show()
 
 
 def rasters_OneStim_allNeurons(patient, session, spikes, stims, dict_clu2tt, dict_elec2deadfile, path_rasters, display_patches=True, plafond_inhib_100=True):
     from matplotlib.transforms import blended_transform_factory
 
-    # D'abord determiner si certaines stims avec mm caracs/mm label exactement
+    # D'abord determiner si certaines stims avec mm caracs/mm label exactement (pour export des figures)
     list_suffix_stim_rep = ['' for _ in range(stims.shape[0])]
-    for s in np.unique(stims['paramètres'].tolist()):
-        if stims['paramètres'].tolist().count(s) > 1:
-            list_ind_stim_repeated = [i for i, x in enumerate(stims['paramètres'].tolist()) if x == s]
-            for ind_stim_rep in list_ind_stim_repeated:
-                list_suffix_stim_rep[ind_stim_rep] = '_' + str(ind_stim_rep + 1)
+    params_list = stims['paramètres'].tolist()
+
+    for param in set(params_list):
+        list_ind_stim_repeated = [i for i, x in enumerate(params_list) if x == param]
+        if len(list_ind_stim_repeated) > 1:
+            for rank, ind_stim_rep in enumerate(list_ind_stim_repeated, start=1):
+                list_suffix_stim_rep[ind_stim_rep] = f'_{rank}'
 
     for ind_stim in range(stims.shape[0]):
         stim_start = stims['t'][ind_stim]
@@ -1496,11 +1498,12 @@ def rasters_OneStim_allNeurons(patient, session, spikes, stims, dict_clu2tt, dic
         plt.subplots_adjust(hspace=0.05, wspace=0.1)
 
         patch_title = '' if display_patches else '_noDead'
+        suffix_rep = list_suffix_stim_rep[ind_stim] # export : ajout suffixe si plusieurs stims identiques 
         title_fig = (
             path_rasters + "Raster - all units for stim " +
             stims['electrode'][ind_stim] + ' ' + stims['plots'][ind_stim] +
-            ', at ' + stims['frequence'][ind_stim] + ', ' + stims['intensite'][ind_stim] +
-            patch_title + ".png")
+            ', ' + stims['frequence'][ind_stim] + ', ' + stims['intensite'][ind_stim] +
+            suffix_rep + patch_title + ".png")
         plt.savefig(title_fig, dpi=300)
         plt.show()
 
