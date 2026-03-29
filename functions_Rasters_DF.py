@@ -687,7 +687,7 @@ def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, 
     return qm_all
 
 
-def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, mpg, patient, session, root, mapping_anat, start_baseline=0, end_baseline=300, epsilon=0.1, verb=False, bin_z=0.05, bin_resp=[0.05, 0.075, 0.1]):
+def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, mpg, patient, session, root, mapping_anat, epsilon=0.1, verb=False, bin_z=0.05, bin_resp=[0.05, 0.075, 0.1]):
     """
     Construit deux tables de résumé pour une session :
     1) summary_by_neuron
@@ -726,8 +726,6 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
     mpg : pd.DataFrame. Table d'information anatomique (tt, lobe, loca, etc.).
     patient, session, root, mapping_anat :
         Paramètres de contexte / I/O.
-    start_baseline, end_baseline : float
-        Bornes de la baseline en secondes.
     epsilon : float
         Petite constante pour stabiliser le calcul du log-ratio.
     verb : bool
@@ -787,10 +785,9 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
         total_duration = get_total_duration(path_folder, patient, session, nb_channels(mapping_anat, patient, session, root)) - np.sum(deadfile_elec[1] - deadfile_elec[0]) # on soustrait deadperiods
         row_unit['fr_global'] = len(spk_times) / (total_duration ) if total_duration > 0 else np.nan # nb de spikes / durée totale
         
-        # fr_baseline / Taux de décharge sur une baseline des premières minutes (0 à 300s par défaut, baissé au début de la stim 1 si commence avant 300 s) :
-        if end_baseline > stims_loca.loc[0,'t']:
-            print('Attention, la baseline finit après le début de la première stim')
-            end_baseline = stims_loca.loc[0,'t']
+        # fr_baseline / Taux de décharge sur une baseline des premières minutes (0 à la stim 1, en retirant les dead periods) :
+        start_baseline = 0
+        end_baseline = stims_loca.loc[0,'t']
         artefacts_filtered_baseline = deadfile_elec[(deadfile_elec[1] >= start_baseline) & (deadfile_elec[0] <= end_baseline)]
         dead_baseline = np.sum(np.minimum(artefacts_filtered_baseline[1], end_baseline) - np.maximum(artefacts_filtered_baseline[0], start_baseline))  
         spk_in_baseline = spk_times[spk_times <= end_baseline] # tous les spikes avant la fin de la baseline
@@ -862,13 +859,13 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                         'tetrode': dict_clu2tt[clu], 
                         'lobe_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
                         'loca_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0],
-                        'lobe_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].str[2:],
-                        'loca_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].str[2:],
+                        'lobe_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'][2:],
+                        'loca_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'][2:],
                         'tt_in_ZE': ttZE, 'tt_in_ZI': ttZI, 'tt_in_ZP': ttZP, 'tt_in_ZL': ttZL, 'tt_in_NI': ttNI,
 
                         # infos sur stim :
                         'stim_label':labels_stims[i][:-8], 'ind_stim' : i,
-                        'stim_Lobe': stim['lobe'].strip(), 'stim_Lobe_noLat' : row_trial['stim_Lobe'].str[2:],
+                        'stim_Lobe': stim['lobe'].strip(), 'stim_Lobe_noLat' : stim['lobe'].strip()[2:],
                         'stim_in_ZE': stimZE, 'stim_in_ZI': stimZI, 'stim_in_ZP': stimZP, 'stim_in_ZL': stimZL, 'stim_in_NI': stimNI,
                         'freq_stim': int(stim['frequence'].strip()[:-3]), 'intensity_stim': float(stim['intensite'].strip()[:-3]), 
 
@@ -918,7 +915,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
     return (pd.DataFrame(data), pd.DataFrame(general_data))
 
 
-def create_or_update_session_summary(patient, session, start_baseline=0, end_baseline=300, root='D:/',verb=False, bin_z=0.05, bin_resp=[0.05, 0.075, 0.1]):
+def create_or_update_session_summary(patient, session, root='D:/',verb=False, bin_z=0.05, bin_resp=[0.05, 0.075, 0.1]):
     ''' Cree le tableau récapitulatif pour une session: summary_by_neuron et general_summary_by_neuron_and_stim, a partir du patient et session
     Tourne pendant environ 30 sec/1 min par session. '''
     path_folder = root + 'Spike-sorting/Data_folders/'+patient+'/'+patient+'_stim'+session+'/'
@@ -933,7 +930,7 @@ def create_or_update_session_summary(patient, session, start_baseline=0, end_bas
     tables_folder = root + 'Spike-sorting/Tables'+'/'
     if not os.path.exists(tables_folder): # si le dossier de Tables n'existe pas encore, alors on le crée
         os.makedirs(tables_folder)
-    summary_df, general_df = compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, mapping_anat, patient, session, root, mapping_anat, start_baseline, end_baseline, verb=verb, bin_z=bin_z, bin_resp=bin_resp)
+    summary_df, general_df = compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, mapping_anat, patient, session, root, mapping_anat, verb=verb, bin_z=bin_z, bin_resp=bin_resp)
     summary_df.to_csv(tables_folder+patient+'_stim'+session+"_summary_by_neuron.csv", index=False)
     summary_df.to_excel(tables_folder+patient+'_stim'+session+"_summary_by_neuron.xlsx", index=False)
     general_df.to_csv(tables_folder+patient+'_stim'+session+"_general_summary_by_neuron_and_stim.csv", index=False)
@@ -959,56 +956,36 @@ def update_all_existing_session_summaries(root='D:/', verb=False, bin_z=0.05, bi
 ############### Big dataframe functions ###############
 
 def update_general_summary_on_all_sessions(root='D:/'):
-    '''Identifie les sessions avec un nwb, tourne sur tous les session_summaries et recrée et renvoie big_df
+    '''Tourne sur tous les session_summaries du dossier Spike-sorting/Tables et recrée et renvoie big_df_trials
     Tourne eviron 40 sec pour une vingtaine de sessions.'''
-    base = Path(root, "Spike-sorting/Data_folders")
+    path_tables = Path(root, "Spike-sorting/Tables")
     
-    nwb_files = []
-    all_gen_summaries, all_summaries_by_nrn = [], [], []  # Liste de DF, pour stocker tous les csv
+    all_summaries_trials, all_summaries_nrn = [], [] # Liste de DF, pour stocker tous les csv, qui seront concaténés
+    path_summaries_trials = path_tables.rglob("*general_summary_by_neuron_and_stim.csv")
+    path_summaries_nrn = path_tables.rglob("*_summary_by_neuron.csv")
 
-    for path in base.rglob("*.nwb"): # pour chaque session traitée, donc pour laquelle on a un .nwb :
-        relative = path.relative_to(base) # On garde les fichiers qui sont exactement à 2 niveaux sous le dossier racine
-        if len(relative.parts) == 3:  # Patient / Session / fichier.nwb
-            nwb_files.append(path)
-            # print(path) # Affichage des nwb d'intéret
+    for path in path_summaries_trials:
+        df_summary_trials = pd.read_csv(path)
+        # On crée une colonne 'global_clu' unique pour s'y retrouver dans l'indexation de l'ensemble des neurones
+        df_summary_trials["global_clu"] = (df_summary_trials["clu"].astype(str).apply(lambda x: f"{df_summary_trials.loc[0,"session"]}_{x}"))
+        all_summaries_trials.append(df_summary_trials)
 
-            patient = relative.parts[0]
-            session = relative.parts[1]
-            gen_summary_path = base / patient / session / f"{session}_general_summary_by_neuron_and_stim.csv"
-            summary_by_neuron_path = base / patient / session / f"{session}_summary_by_neuron.csv"
+    for path in path_summaries_nrn:
+        df_summary_nrn = pd.read_csv(path)
+        all_summaries_nrn.append(df_summary_nrn)
 
-            if gen_summary_path.exists():
-                # on récupère general_summary (par neurone et par stimulation)
-                general_summary = pd.read_csv(gen_summary_path)
-                # On crée une colonne 'global_clu' unique pour s'y retrouver dans l'indexation de l'ensemble des neurones
-                general_summary["patient"] = patient
-                general_summary["session"] = session
-                general_summary["global_clu"] = (general_summary["clu"].astype(str).apply(lambda x: f"{session}_{x}"))
-                
-                all_gen_summaries.append(general_summary)
-
-                # on récupère summary_by_neuron (par neurone)
-                summary_by_nrn = pd.read_csv(summary_by_neuron_path)
-                all_summaries_by_nrn.append(summary_by_nrn)
-
-                # on récupère les stims
-                if os.path.exists(base / patient / session / f"{session}_stim_events_TRC_re-shifted.txt"):
-                    stims_loca = pd.read_csv(base / patient / session / f"{session}_stim_events_TRC_re-shifted_loca.txt", header=None)
-                else:
-                    stims_loca = pd.read_csv(base / patient / session / f"{session}_stim_events_TRC_shifted_loca.txt", header=None)
-
-    # Empile tous les DataFrames de type summary
-    big_df = pd.concat(all_gen_summaries, ignore_index=True)
-    big_df_by_nrn = pd.concat(all_summaries_by_nrn, ignore_index=True)
+    # Empile tous les dataframes de type summary
+    big_df_trials = pd.concat(all_summaries_trials, ignore_index=True)
+    big_df_by_nrn = pd.concat(all_summaries_nrn, ignore_index=True)
 
     # Export des dataframes generaux
-    big_df.to_excel(root+"Spike-sorting/Tables/general_summary_all_sessions.xlsx", index=False)
-    big_df.to_csv(root+"Spike-sorting/Tables/general_summary_all_sessions.csv", index=False)
+    big_df_trials.to_excel(root+"Spike-sorting/Tables/general_summary_all_sessions.xlsx", index=False)
+    big_df_trials.to_csv(root+"Spike-sorting/Tables/general_summary_all_sessions.csv", index=False)
     
     big_df_by_nrn.to_excel(root+"Spike-sorting/Tables/summary_by_nrn_all_sessions.xlsx", index=False)
     big_df_by_nrn.to_csv(root+"Spike-sorting/Tables/summary_by_nrn_all_sessions.csv", index=False)
     
-    return big_df
+    return big_df_trials
 
 
 ##################################################
