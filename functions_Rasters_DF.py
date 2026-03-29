@@ -879,7 +879,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             distance_tt_stim = euclidian_distance(xyz_tt, xyz_stim, verb=verb)
 
             # Distance semi-qualitative (inf4cm ; meme electrode ; meme lobe ; controlatéral) :
-            sameElec = electrodes_equal(dict_clu2tt[clu][:-1],stims_loca.loc[i,'electrode']), # localité du neurone par rapport aux stimulations
+            sameElec = electrodes_equal(dict_clu2tt[clu][:-1],stims_loca.loc[i,'electrode']) # localité du neurone par rapport aux stimulations
             sameLobe = (mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0] == stim['lobe'].strip())
             stim_Lobe = stim['lobe'].strip()
             distance_semi_quali = distance_semi_qualitative(distance_tt_stim, sameElec, sameLobe, stim_Lobe, lobe_tt)
