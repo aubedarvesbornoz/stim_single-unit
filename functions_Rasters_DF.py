@@ -360,6 +360,21 @@ def euclidian_distance(xyz_tt, xyz_stim,verb=False):
     
     return np.linalg.norm(xyz_tt - xyz_stim) # Distance euclidienne
 
+def distance_semi_qualitative(distance_tt_stim, sameElec, sameLobe, stim_Lobe, lobe_tt):
+    if distance_tt_stim <= 40:
+        distance_semi_quali = 'local_inf4cm'
+    elif sameElec == True:
+        distance_semi_quali = 'local_elec'
+    elif sameLobe == True:
+        distance_semi_quali = 'local_lobe'
+    elif stim_Lobe[0] != lobe_tt[0]: # controlat
+        distance_semi_quali = 'controlat'
+    else: # np.nan si aucune des conditions précédentes ne convient
+        distance_semi_quali = np.nan
+    return distance_semi_quali
+
+def remove_laterality(s): # enleve R, R., L, L. au debut d'une loca ou lobe
+    return re.sub(r"^[LR]\.?\s+", "", s)
 
 ############### ZE ou hors ZE ###############
 
@@ -744,6 +759,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
     # --------------
     # Initialisation
     # --------------
+    import re
     path_folder = root + f'Spike-sorting/Data_folders/{patient}/{patient}_stim{session}/'
     stimic_session='stimic'+session
     all_clu_ids = list(dict_clu2tt.keys()) # liste des indices de tous les neurones
@@ -766,11 +782,12 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             continue
         
         # Initialisation de la ligne "par neurone" 
+        lobe_tt = mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0] # aussi utilisé après
         row_unit = {'patient': patient, 'session':stimic_session, 'clu': clu, 'tetrode': dict_clu2tt[clu],
-                    'lobe_tt' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
+                    'lobe_tt' : lobe_tt,
                     'loca_tt' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0],
-                    'lobe_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].str[2:],
-                    'loca_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].str[2:]} # Initialisation de la ligne de ce neurone
+                    'lobe_tt_noLat' : remove_laterality(lobe_tt),
+                    'loca_tt_noLat' : remove_laterality(mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0])} # Initialisation de la ligne de ce neurone
         
         # ajout des quality metrics :
         if clu in list(qm.index):
@@ -848,7 +865,13 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             xyz_tt = find_back_XYZ_from_macro(coord_MNI_pat, find_back_macrocontacts_from_tt(normalize_name(dict_clu2tt[clu][:-1]), coord_MNI_pat,verb=verb)[0], find_back_macrocontacts_from_tt(normalize_name(dict_clu2tt[clu][:-1]), coord_MNI_pat,verb=verb)[1], verb=verb)
             xyz_stim = find_back_XYZ_from_macro(coord_MNI_pat, stims_loca.loc[i, 'electrode'], stims_loca.loc[i, 'plots'], verb=verb)
             distance_tt_stim = euclidian_distance(xyz_tt, xyz_stim, verb=verb)
-            
+
+            # Distance semi-qualitative (inf4cm ; meme electrode ; meme lobe ; controlatéral) :
+            sameElec = electrodes_equal(dict_clu2tt[clu][:-1],stims_loca.loc[i,'electrode']), # localité du neurone par rapport aux stimulations
+            sameLobe = (mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0] == stim['lobe'].strip())
+            stim_Lobe = stim['lobe'].strip()
+            distance_semi_quali = distance_semi_qualitative(distance_tt_stim, sameElec, sameLobe, stim_Lobe, lobe_tt)
+
             # Stim en ZE, ZI, etc / Tetrode en ZE, ZI, etc :
             stimZE, stimZI, stimZP, stimZL, stimNI = is_in_ZEZIZPZLNI(patient, stims_loca.loc[i, 'electrode'], stims_loca.loc[i, 'plots'], root)
             
@@ -857,22 +880,21 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             row_trial = {'patient': patient, 'session':stimic_session, 'clu': clu, 
                         # infos sur tetrode :
                         'tetrode': dict_clu2tt[clu], 
-                        'lobe_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0],
-                        'loca_tt':mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0],
-                        'lobe_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'][2:],
-                        'loca_tt_noLat' : mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'][2:],
+                        'lobe_tt': lobe_tt,
+                        'loca_tt': mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0],
+                        'lobe_tt_noLat' : remove_laterality(lobe_tt),
+                        'loca_tt_noLat' : remove_laterality(mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'loca'].values[0]),
                         'tt_in_ZE': ttZE, 'tt_in_ZI': ttZI, 'tt_in_ZP': ttZP, 'tt_in_ZL': ttZL, 'tt_in_NI': ttNI,
 
                         # infos sur stim :
                         'stim_label':labels_stims[i][:-8], 'ind_stim' : i,
-                        'stim_Lobe': stim['lobe'].strip(), 'stim_Lobe_noLat' : stim['lobe'].strip()[2:],
+                        'stim_Lobe': stim_Lobe, 'stim_Lobe_noLat' : remove_laterality(stim_Lobe),
                         'stim_in_ZE': stimZE, 'stim_in_ZI': stimZI, 'stim_in_ZP': stimZP, 'stim_in_ZL': stimZL, 'stim_in_NI': stimNI,
                         'freq_stim': int(stim['frequence'].strip()[:-3]), 'intensity_stim': float(stim['intensite'].strip()[:-3]), 
 
                         # Topographie : sameElec, sameLobe / Distance avec la stim / stim ou tt en ZE,ZI,ZP,ZL,NI 
-                        'sameElec': electrodes_equal(dict_clu2tt[clu][:-1],stims_loca.loc[i,'electrode']), # localité du neurone par rapport aux stimulations,
-                        'sameLobe': (mpg.loc[mpg['tt'] == dict_clu2tt[clu], 'lobe'].values[0] == stim['lobe'].strip()), 
-                        'distance_tt_stim': distance_tt_stim, 
+                        'sameElec': sameElec, 'sameLobe': sameLobe, 
+                        'distance_tt_stim': distance_tt_stim, 'distance_semi_quali':distance_semi_quali,
 
                         # infos sur dynamique neuronale :
                         'fr_global': row_unit['fr_global'], 'fr_baseline': row_unit['fr_baseline'],
@@ -910,7 +932,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                 row_trial[f'excit_general_{bin_r_i}s_bins'] = row_trial[f'excit_only_{bin_r_i}s_bins'] + row_trial[f'inhib_then_excit_{bin_r_i}s_bins'] + row_trial[f'excit_then_inhib_{bin_r_i}s_bins']
 
             general_data.append(row_trial) # une ligne par neurone et par stim
-            data.append(row_unit) # une ligne par neurone
+        data.append(row_unit) # une ligne par neurone
 
     return (pd.DataFrame(data), pd.DataFrame(general_data))
 
@@ -968,7 +990,7 @@ def update_general_summary_on_all_sessions(root='D:/'):
     for path in path_summaries_trials:
         df_summary_trials = pd.read_csv(path)
         # On crée une colonne 'global_clu' unique pour s'y retrouver dans l'indexation de l'ensemble des neurones
-        df_summary_trials["global_clu"] = (df_summary_trials["clu"].astype(str).apply(lambda x: f"{df_summary_trials.loc[0,"session"]}_{x}"))
+        df_summary_trials["global_clu"] = (df_summary_trials["clu"].astype(str).apply(lambda x: f"{df_summary_trials.loc[0,"patient"]}_{df_summary_trials.loc[0,"session"]}_{x}"))
         all_summaries_trials.append(df_summary_trials)
 
     for path in path_summaries_nrn:
