@@ -777,15 +777,22 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
     qm = quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, dict_clu2tt, root)[list_col_qm]
 
     # --- Chargement éventuel d'un fichier de stim avec colonne cognitive ("cog") ---
-    # Ce fichier, s'il existe, est supposé correspondre ligne à ligne à stims_loca
+    # Ce fichier, s'il existe, correspond ligne à ligne à stims_loca
     # avec une colonne supplémentaire 'cog' en fin de table.
     path_cog = (path_folder + f"{patient}_stim{session}_stim_events_TRC_re-shifted_loca_COG.txt")
     if os.path.exists(path_cog):
         stims_with_cog = pd.read_csv(path_cog, sep=';')
-        if 'cog' in stims_with_cog.columns:
-            cog_by_stim = stims_with_cog['cog'].apply(lambda x: np.nan if pd.isna(x) or str(x).strip() == '' else ast.literal_eval(x))
-        else:
-            print(f"⚠️ Fichier COG trouvé mais sans colonne 'cog' : {path_cog}")
+        cog_by_stim = stims_with_cog['cog'].apply(lambda x: np.nan if pd.isna(x) or str(x).strip() == '' else ast.literal_eval(x))
+
+    # --- Chargement éventuel d'un fichier de stim avec colonne "post_decharge" ---
+    # Ce fichier, s'il existe, correspond ligne à ligne à stims_loca
+    # avec une colonne supplémentaire 'post_decharge' en fin de table, avec liste de tetrodes avec AD par stim
+    # path_AD = (path_folder + f"{patient}_stim{session}_stim_events_TRC_re-shifted_loca_AD.txt")
+    # if os.path.exists(path_AD):
+    #     stims_with_AD = pd.read_csv(path_AD, sep=';')
+    #     AD_by_stim = stims_with_AD['cog'].apply(lambda x: np.nan if pd.isna(x) or str(x).strip() == '' else ast.literal_eval(x))
+    # else:
+    #     AD_by_stim = [np.nan for _ in range(stims_loca.shape[0])]
 
     for _, clu in enumerate(all_clu_ids): # pour chaque neurone
         
@@ -833,7 +840,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             t_pre_start = stim['t'] - pre_duration
             t_pre_end = stim['t']
             t_post_start = stim['t'] + stim['durée']
-            t_post_end = stim['t'] + stim['durée'] + post_duration
+            t_post_end = stim['t + durée'] + post_duration
             pre_spike_times = spk_times[(spk_times >= t_pre_start) & (spk_times < t_pre_end)]
             post_spike_times = spk_times[(spk_times >= t_post_start) & (spk_times < t_post_end)]
 
@@ -844,6 +851,22 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
             fr_pre = len(pre_spike_times) / (pre_duration - dead_pre) # les 10 sec sont diminuees avec quantité d'artefact dans deadfile
             fr_post = len(post_spike_times) / (post_duration - dead_post) # les 10 sec sont diminuees avec quantité d'artefact dans deadfile
 
+            # Quantifier la reponse post-stim :
+            # Wilcoxon pre/post :
+            # on met d'abord a jour la somme des periodes enlevées sur ce trial
+            artefacts_filtered_pre = deadfile_elec[(deadfile_elec[1] >= stim['t'] -10) & (deadfile_elec[0] <= stim['t'])]
+            artefacts_filtered_post = deadfile_elec[(deadfile_elec[1] >= stim['t + durée']) & (deadfile_elec[0] <= stim['t + durée']+10)]
+            
+            _, pval_wilcoxon, _, _, _ = _compute_binned_rates_and_wilcoxon(
+                pre_spikes_rel=pre_spike_times - stim['t'],   # temps relatifs à stim_start
+                post_spikes_rel= post_spike_times - stim['t + durée'],   # temps relatifs à stim_end
+                stim_start=stim['t'],
+                stim_end=stim['t + durée'],
+                deadfile_elec=deadfile_elec,
+                bin_size=0.1,     
+                window=10,
+                min_valid_bin_frac=0.8)
+                
             # delta_pre_post, delta_baseline_post / % de variation :
             if fr_pre == 0:
                 delta_pre_post = np.nan
@@ -903,7 +926,8 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                         'stim_Lobe': stim_Lobe, 'stim_Lobe_noLat' : remove_laterality(stim_Lobe),
                         'stim_in_ZE': stimZE, 'stim_in_ZI': stimZI, 'stim_in_ZP': stimZP, 'stim_in_ZL': stimZL, 'stim_in_NI': stimNI,
                         'freq_stim': int(stim['frequence'].strip()[:-3]), 'intensity_stim': float(stim['intensite'].strip()[:-3]), 
-                        'cog': cog_by_stim.loc[i],
+                        'cog': cog_by_stim.loc[i], #'after_discharge':[True if type(AD_by_stim.loc[i])==list else False][0], # AD vrai s'il y a une AD avec cette stim
+                        #'after_discharge_loc': [True if dict_clu2tt[clu] in AD_by_stim.loc[i] else False][0], # AD local vrai si tetrode dans liste de tetrodes concernées par une AD 
 
                         # Topographie : sameElec, sameLobe / Distance avec la stim / stim ou tt en ZE,ZI,ZP,ZL,NI 
                         'sameElec': sameElec, 'sameLobe': sameLobe, 
@@ -911,6 +935,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
 
                         # infos sur dynamique neuronale :
                         'fr_global': row_unit['fr_global'], 'fr_baseline': row_unit['fr_baseline'],
+                        'pval_wilcoxon':pval_wilcoxon, 'wilcoxon_signif':[True if pval_wilcoxon < 0.05 else False][0],
                         'delta_pre_post':delta_pre_post, 'delta_baseline_post':delta_baseline_post, 
                         'fr_pre': fr_pre, 'fr_post': fr_post,  'log_ratio': log_ratio,
                         'zscore_pre': z_score_pre, 'modulation_index': modulation_index}
@@ -924,7 +949,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                     row_trial[metric] = np.nan
 
             # FR_pre(t), FR_post(t): pre_counts_i and post_counts_i with bin_r size = [0.05, 0.075, 0.1]
-            for ind_bin, bin_r_i in enumerate(bin_resp):
+            for bin_r_i in bin_resp:
                 bins_edges_i = np.arange(0, post_duration + bin_r_i, bin_r_i)
                 post_counts_i, _ = np.histogram(post_spike_times - t_post_start, bins=bins_edges_i)
                 pre_counts_i, _ = np.histogram(pre_spike_times - t_pre_start, bins=bins_edges_i)
