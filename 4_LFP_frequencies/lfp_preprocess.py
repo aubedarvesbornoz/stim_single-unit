@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-lfp_utils.py
-============
+lfp_preprocess.py
+=================
 
 Module utilitaire pour l'analyse exploratoire et inférentielle des dynamiques
 LFP post-stimulation.
@@ -12,24 +12,7 @@ Ce module regroupe, dans un seul fichier réutilisable depuis un notebook :
 - la lecture et la fusion des tables d'événements,
 - la gestion des canaux invalides et du montage bipolaire adjacent,
 - la lecture de TRC Micromed,
-- le prétraitement du signal (filtres, montage) et l'extraction des epochs pré/post,
-- le calcul temps-fréquence par ondelettes de Morlet,
-- la normalisation à la baseline selon plusieurs métriques,
-- la sauvegarde des variables intermédiaires par canal (en .npy),
-- la génération de figures essai par essai (temps-fréquences brut/normalisé par canal et stim),
-- les regroupements d'essais par condition cognitive et topographique,
-- les statistiques par condition sur cartes TF déjà exportées,
-- les orchestrateurs session par session ou sur l'ensemble des sessions.
-
-Critères de regroupement des essais en conditions :
-- regroupement des stims selon catégories cog (avec/sans sous-types)
-- regroupement des canaux d'une session selon distance à la stim : local (= meme électrode que stim) VS distant (= électrode differente)
-
-Le module est conçu pour être piloté depuis un ou plusieurs notebooks, avec des
-appels séparés pour :
-1) la préparation et le calcul Morlet,
-2) la génération de figures exploratoires,
-3) les statistiques par condition sur les cartes déjà exportées.
+- le prétraitement du signal (filtres, montage) et l'extraction des epochs pré/post.
 
 Auteur : Aube Darves-Bornoz
 """
