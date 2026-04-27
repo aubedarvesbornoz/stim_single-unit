@@ -52,19 +52,19 @@ from typing import Dict, List, Optional, Sequence, Tuple, Any
 import numpy as np
 import pandas as pd
 from scipy import signal
+import os
 
 from lfp_preprocess import (
     log,
     ensure_dir,
     safe_name,
     normalize_channel_name,
-    # parse_bipolar_shaft,
-    # parse_list_cell,
     list_trc_sessions,
+    read_stim_events,
+    recover_precise_macro_stim_events,
     find_cog_file,
-    find_duration_file,
+    # find_duration_file,
     read_cog_file,
-    read_duration_file,
     merge_event_tables,
     load_bad_channels_table,
     get_bad_channels_for_session,
@@ -325,7 +325,7 @@ def build_pre_first_stim_reference_segment(data: np.ndarray,
 
 def compute_hilbert_subband_envelopes(data_bp: np.ndarray,
                                       sfreq: float,
-                                      trials_df: pd.DataFrame,
+                                      stims_df: pd.DataFrame,
                                       cfg: HilbertConfig) -> Dict[str, np.ndarray]:
     """
     Calcule les enveloppes Hilbert normalisées pour toutes les sous-bandes, 
@@ -333,7 +333,7 @@ def compute_hilbert_subband_envelopes(data_bp: np.ndarray,
     """
     out: Dict[str, np.ndarray] = {}
 
-    first_stim_t = float(trials_df["t_start"].min())
+    first_stim_t = float(stims_df["t_start"].min())
     reference_raw = build_pre_first_stim_reference_segment(data_bp, sfreq, first_stim_t)
 
     for family, f_low, f_high in flatten_subbands(build_hilbert_subbands(cfg)):
@@ -378,7 +378,7 @@ def compute_hilbert_subband_envelopes(data_bp: np.ndarray,
 
 def extract_epochs_from_continuous_feature(feature_data: np.ndarray,
                                            sfreq: float,
-                                           trials_df: pd.DataFrame,
+                                           stims_df: pd.DataFrame,
                                            pre_length: float,
                                            post_length: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -402,7 +402,7 @@ def extract_epochs_from_continuous_feature(feature_data: np.ndarray,
     epochs = []
     keep_idx = []
 
-    for i, row in trials_df.iterrows():
+    for i, row in stims_df.iterrows():
         pre_start_idx = int(round(row["pre_start"] * sfreq))
         pre_end_idx = pre_start_idx + n_pre
 
@@ -475,17 +475,17 @@ def aggregate_subbands_to_main_bands(subband_epochs: Dict[str, np.ndarray],
 def save_hilbert_session_metadata(session_out: Path,
                                   session: str,
                                   cfg: HilbertConfig,
-                                  trials_df: pd.DataFrame,
+                                  stims_df: pd.DataFrame,
                                   raw_ch_names: Sequence[str],
                                   bad_channels: Sequence[str],
                                   bp_names: Sequence[str]) -> None:
     """Sauvegarde la trial table et les métadonnées de session Hilbert."""
     ensure_dir(session_out)
-    trials_df.to_csv(session_out / f"{session}_trial_table.csv", index=False)
+    stims_df.to_csv(session_out / f"{session}_trial_table.csv", index=False)
     meta = {
         "session": session,
         "config": asdict(cfg),
-        "n_trials": int(len(trials_df)),
+        "n_trials": int(len(stims_df)),
         "n_raw_channels": int(len(raw_ch_names)),
         "n_bad_channels": int(len(bad_channels)),
         "n_bipolar_channels": int(len(bp_names)),
@@ -531,7 +531,7 @@ def load_hilbert_session_exports(session_dir: Path, session: Optional[str] = Non
     return {
         "session": session_name,
         "metadata": metadata,
-        "trials_df": pd.read_csv(trials_file),
+        "stims_df": pd.read_csv(trials_file),
         "times": np.load(times_file),
     }
 
@@ -566,10 +566,15 @@ def prepare_hilbert_session_data(session: str,
     if not trc_path.exists():
         raise FileNotFoundError(f"TRC introuvable pour {session}: {trc_path}")
 
-    cog_df = read_cog_file(find_cog_file(root_dir, session))
-    dur_df = read_duration_file(find_duration_file(root_dir, session))
-    trials_df = merge_event_tables(session, cog_df, dur_df)
-    trials_df = add_windows_to_trials(trials_df, pre_length=cfg.pre_length, post_length=cfg.post_length, epsilon=cfg.epsilon)
+    cog_df = read_cog_file(find_cog_file(root_dir, session)) # annotations cognitives et lobe, ordre des stims considéré comme fiable
+    trc_corr_path = root_dir / f"{session}_stim_events_TRC_corrected.txt"
+    if os.path.exists(trc_corr_path):    
+        trc_corr_df = read_stim_events(trc_corr_path)  # temps réels de début et durée des stims
+    else: # n'existe pas encore, a creer
+        trc_corr_df = recover_precise_macro_stim_events(session, root_dir)
+
+    stims_df = merge_event_tables(session, cog_df, trc_corr_df)
+    stims_df = add_windows_to_trials(stims_df, pre_length=cfg.pre_length, post_length=cfg.post_length, epsilon=cfg.epsilon)
 
     raw = load_trc_as_mne_raw(trc_path, verbose=verbose)
     sfreq = float(raw.info["sfreq"])
@@ -577,8 +582,8 @@ def prepare_hilbert_session_data(session: str,
     raw_data = raw.get_data()
     signal_duration_s = raw_data.shape[1] / sfreq
 
-    trials_df = keep_trials_fitting_signal(trials_df, signal_duration_s, verbose=verbose)
-    if len(trials_df) == 0:
+    stims_df = keep_trials_fitting_signal(stims_df, signal_duration_s, verbose=verbose)
+    if len(stims_df) == 0:
         raise RuntimeError(f"{session}: aucun essai exploitable après contrôle des fenêtres")
 
     bad_channels = get_bad_channels_for_session(bad_df, session)
@@ -602,7 +607,7 @@ def prepare_hilbert_session_data(session: str,
     return {
         "session": session,
         "sfreq": sfreq,
-        "trials_df": trials_df,
+        "stims_df": stims_df,
         "raw_ch_names": raw_ch_names,
         "bad_channels": bad_channels,
         "bp_names": bp_names,
@@ -618,7 +623,7 @@ def run_session_hilbert(session_data: Dict[str, Any],
     verbose = cfg.verbose
     session = session_data["session"]
     sfreq = float(session_data["sfreq"])
-    trials_df = session_data["trials_df"].copy()
+    stims_df = session_data["stims_df"].copy()
     raw_ch_names = session_data["raw_ch_names"]
     bad_channels = session_data["bad_channels"]
     bp_names = session_data["bp_names"]
@@ -626,7 +631,7 @@ def run_session_hilbert(session_data: Dict[str, Any],
 
     log(f"\n=== Hilbert session {session} ===", verbose)
 
-    subband_cont = compute_hilbert_subband_envelopes(data_bp=data_bp, sfreq=sfreq, trials_df=trials_df, cfg=cfg)
+    subband_cont = compute_hilbert_subband_envelopes(data_bp=data_bp, sfreq=sfreq, stims_df=stims_df, cfg=cfg)
     subband_epochs: Dict[str, np.ndarray] = {}
     keep_idx_ref = None
     times_ref = None
@@ -635,7 +640,7 @@ def run_session_hilbert(session_data: Dict[str, Any],
         epochs, times, keep_idx = extract_epochs_from_continuous_feature(
             feature_data=env_cont,
             sfreq=sfreq,
-            trials_df=trials_df,
+            stims_df=stims_df,
             pre_length=cfg.pre_length,
             post_length=cfg.post_length,
         )
@@ -651,7 +656,7 @@ def run_session_hilbert(session_data: Dict[str, Any],
     if keep_idx_ref is None or times_ref is None or len(keep_idx_ref) == 0:
         raise RuntimeError(f"{session}: aucun epoch Hilbert extrait")
 
-    trials_df = trials_df.iloc[keep_idx_ref].reset_index(drop=True)
+    stims_df = stims_df.iloc[keep_idx_ref].reset_index(drop=True)
 
     # décimation optionnelle vers un pas proche de 16 ms
     decim = compute_target_decim_factor(sfreq=sfreq, target_dt_ms=cfg.target_dt_ms)
@@ -667,7 +672,7 @@ def run_session_hilbert(session_data: Dict[str, Any],
     session_out = out_dir / session
     ensure_dir(session_out)
     np.save(session_out / f"{session}_times.npy", times_ref.astype(np.float32))
-    save_hilbert_session_metadata(session_out, session, cfg, trials_df, raw_ch_names, bad_channels, bp_names)
+    save_hilbert_session_metadata(session_out, session, cfg, stims_df, raw_ch_names, bad_channels, bp_names)
 
     if cfg.save_subband_epochs:
         for sub_name, arr in subband_epochs.items():

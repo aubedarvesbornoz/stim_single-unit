@@ -33,6 +33,7 @@ import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import os
 
 import matplotlib.pyplot as plt
 import mne
@@ -47,10 +48,12 @@ from lfp_preprocess import (
     reduce_baseline_stat,
     normalize_channel_name,
     build_adjacent_bipolar_pairs,
+    read_stim_events,
+    recover_precise_macro_stim_events,
     find_cog_file,
-    find_duration_file,
+    # find_duration_file,
     read_cog_file,
-    read_duration_file,
+    # read_duration_file,
     merge_event_tables,
     get_bad_channels_for_session,
     load_bad_channels_table,
@@ -550,12 +553,16 @@ def prepare_session_data(
     if not trc_path.exists():
         raise FileNotFoundError(f"TRC introuvable pour {session}: {trc_path}")
 
-    cog_file = find_cog_file(root_dir, session)
-    dur_file = find_duration_file(root_dir, session)
+    # dur_file = find_duration_file(root_dir, session)
+    cog_df = read_cog_file(find_cog_file(root_dir, session))  # annotations cognitives et lobe, ordre des stims considéré comme fiable
 
-    cog_df = read_cog_file(cog_file)  # annotations cognitives et lobe, ordre des stims considéré comme fiable
-    dur_df = read_duration_file(dur_file)  # temps réels de début et durée des stims
-    stims_df = merge_event_tables(session, cog_df, dur_df)
+    trc_corr_path = root_dir / f"{session}_stim_events_TRC_corrected.txt"
+    if os.path.exists(trc_corr_path):    
+        trc_corr_df = read_stim_events(trc_corr_path)  # temps réels de début et durée des stims
+    else: # n'existe pas encore, a creer
+        trc_corr_df = recover_precise_macro_stim_events(session, root_dir)
+
+    stims_df = merge_event_tables(session, cog_df, trc_corr_df)
     stims_df = add_windows_to_trials(
         stims_df,
         pre_length=cfg.pre_length,

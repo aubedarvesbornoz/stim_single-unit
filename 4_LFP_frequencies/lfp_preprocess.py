@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
+import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mne
@@ -530,6 +531,130 @@ def list_trc_sessions(root_dir: Path) -> List[str]:
     return sorted(set(sessions))
 
 
+def read_stim_events(path: str | Path) -> pd.DataFrame:
+    """
+    Lit un fichier stim_events avec colonnes :
+    label_stim, t_start, duration
+
+    Compatible séparateurs tab, virgule, point-virgule ou espaces.
+    """
+    path = Path(path)
+
+    df = pd.read_csv(path, sep=None, engine="python")
+
+    expected = ["label_stim", "t_start", "duration"]
+    if list(df.columns[:3]) != expected:
+        # fallback si fichier sans header, car parfois noms colonnes présents, parfois absents, 
+        # selon type de fichier = 3 colonnes sans nom (events TRC bruts), ou plus de colonnes, mais labellisées.
+
+        # df = pd.read_csv(
+        #     path,
+        #     sep=None,
+        #     engine="python",
+        #     header=None,
+        #     names=expected,
+        # )
+        df.columns[:3] = expected
+
+    df = df[expected].copy()
+    df["label_stim"] = df["label_stim"].astype(str)
+    df["t_start"] = pd.to_numeric(df["t_start"])
+    df["duration"] = pd.to_numeric(df["duration"])
+    return df
+
+
+def recover_precise_macro_stim_events(
+    session: str,
+    root_dir: Path
+) -> pd.DataFrame:
+    """
+    Reconstruit les bornes précises des stimulations en référentiel TRC/macro,
+    à partir des corrections manuelles effectuées en référentiel micro.
+    Si table déjà créée/sauvegardée, la renvoie directement.
+
+    Parameters
+    ----------
+    session : str
+        Nom de session.
+    root_dir : Path
+        Dossier racine contenant TRC et tables d'événements.
+    trc_events_path:
+        Fichier original en référentiel TRC/macro :
+        label_stim, t_start, duration
+
+    shifted_events_path:
+        Fichier TRC translaté approximativement vers le référentiel micro :
+        label_stim, t_start, duration
+
+    reshifted_events_path:
+        Fichier corrigé précisément en référentiel micro :
+        label_stim, t_start, duration
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame avec :
+        label_stim, t_start, duration, t_end,
+        correction_start, correction_end
+    """
+    trc_events_path = root_dir / f"{session}_stim_events_TRC.txt"
+    trc_corrected_path = root_dir / f"{session}_stim_events_TRC_corrected.txt"
+    if os.path.exists(trc_corrected_path):
+        # le fichier a déjà été créé auparavant
+        return pd.read_csv(trc_corrected_path)
+    
+    else : # sinon on crée le fichier, en recalant les events TRC d'apres le recalage manuel des events micro, dans le référentiel micro
+        shifted_events_path = root_dir / f"{session}_stim_events_TRC_shifted.txt"
+        reshifted_events_path = root_dir / f"{session}_stim_events_TRC_re-shifted.txt"
+
+        trc = read_stim_events(trc_events_path) # events TRC originaux (start approximatif, et sans durée)
+        shifted = read_stim_events(shifted_events_path) # events TRC translatés approximativement vers le référentiel micro (un decalage commun par rapport a une stim)
+        reshifted = read_stim_events(reshifted_events_path) # events re-corrigés précisément/manuellement en référentiel micro 
+
+        if not (len(trc) == len(shifted) == len(reshifted)):
+            raise ValueError(
+                "Les trois fichiers n'ont pas le même nombre de stimulations : "
+                f"TRC={len(trc)}, shifted={len(shifted)}, re-shifted={len(reshifted)}"
+            )
+
+        if not (
+            trc["label_stim"].values == shifted["label_stim"].values
+        ).all():
+            raise ValueError(
+                "Les labels ne correspondent pas entre TRC et shifted. "
+                "Vérifie que l'ordre des lignes est identique."
+            )
+
+        if not (
+            trc["label_stim"].values == reshifted["label_stim"].values
+        ).all():
+            raise ValueError(
+                "Les labels ne correspondent pas entre TRC et re-shifted. "
+                "Vérifie que l'ordre des lignes est identique."
+            )
+
+        trc_start = trc["t_start"].to_numpy(float)
+        shifted_start = shifted["t_start"].to_numpy(float)
+        reshifted_start = reshifted["t_start"].to_numpy(float)
+
+        correction_start = reshifted_start - shifted_start
+        macro_precise_start = trc_start + correction_start
+
+        out = pd.DataFrame({
+            "label_stim": trc["label_stim"].values,
+            "t_start": macro_precise_start,
+            "duration": reshifted["duration"].to_numpy(float), # la durée est juste la plus précise possible telle qu'identifiée a la main
+            "t_end": macro_precise_start + reshifted["duration"].to_numpy(float), # a partir de debut et durée précis,  on a la fin précise
+            "correction_start": correction_start
+        })
+        
+        if output_path is not None:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            out.to_csv(output_path, sep="\t", index=False)
+
+        return out
+
 
 def find_cog_file(root_dir: Path, session: str) -> Path:
     """
@@ -556,26 +681,26 @@ def find_cog_file(root_dir: Path, session: str) -> Path:
 
 
 
-def find_duration_file(root_dir: Path, session: str) -> Path:
-    """
-    Recherche le fichier de durée/temps de stimulation d'une session.
+# def find_duration_file(root_dir: Path, session: str) -> Path:
+#     """
+#     Recherche le fichier de durée/temps de stimulation d'une session.
 
-    Paramètres
-    ----------
-    root_dir : Path
-        Dossier racine de la session.
-    session : str
-        Nom de session.
+#     Paramètres
+#     ----------
+#     root_dir : Path
+#         Dossier racine de la session.
+#     session : str
+#         Nom de session.
 
-    Retour
-    ------
-    Path
-        Chemin vers le fichier duration correspondant.
-    """
-    fp = root_dir / f"{session}_stim_events_TRC_duration.txt"
-    if not fp.exists():
-        raise FileNotFoundError(f"Fichier duration introuvable: {fp}")
-    return fp
+#     Retour
+#     ------
+#     Path
+#         Chemin vers le fichier duration correspondant.
+#     """
+#     fp = root_dir / f"{session}_stim_events_TRC_duration.txt"
+#     if not fp.exists():
+#         raise FileNotFoundError(f"Fichier duration introuvable: {fp}")
+#     return fp
 
 
 
@@ -614,39 +739,39 @@ def read_cog_file(cog_file: Path) -> pd.DataFrame:
 
 
 
-def read_duration_file(duration_file: Path) -> pd.DataFrame:
-    """
-    Lit le fichier contenant les bons temps de début et durées des stimulations.
+# def read_duration_file(duration_file: Path) -> pd.DataFrame:
+#     """
+#     Lit le fichier contenant les bons temps de début et durées des stimulations.
 
-    Format attendu
-    --------------
-    Fichier sans noms de colonnes, contenant a minima :
-    label_stim, t_start, duration
+#     Format attendu
+#     --------------
+#     Fichier sans noms de colonnes, contenant a minima :
+#     label_stim, t_start, duration
 
-    Paramètres
-    ----------
-    duration_file : Path
-        Chemin vers le fichier de durée.
+#     Paramètres
+#     ----------
+#     duration_file : Path
+#         Chemin vers le fichier de durée.
 
-    Retour
-    ------
-    pd.DataFrame
-        Table normalisée avec colonnes ['label_stim', 't_start', 'duration'].
-    """
-    df = pd.read_csv(duration_file, sep=",", engine="python", header=None)
-    if df.shape[1] < 3:
-        raise ValueError(f"Le fichier {duration_file.name} doit avoir au moins 3 colonnes")
+#     Retour
+#     ------
+#     pd.DataFrame
+#         Table normalisée avec colonnes ['label_stim', 't_start', 'duration'].
+#     """
+#     df = pd.read_csv(duration_file, sep=",", engine="python", header=None)
+#     if df.shape[1] < 3:
+#         raise ValueError(f"Le fichier {duration_file.name} doit avoir au moins 3 colonnes")
 
-    df = df.iloc[:, :3].copy()
-    df.columns = ["label_stim", "t_start", "duration"]
-    df["label_stim"] = df["label_stim"].astype(str).str.strip()
-    df["t_start"] = pd.to_numeric(df["t_start"], errors="coerce")
-    df["duration"] = pd.to_numeric(df["duration"], errors="coerce")
-    return df
+#     df = df.iloc[:, :3].copy()
+#     df.columns = ["label_stim", "t_start", "duration"]
+#     df["label_stim"] = df["label_stim"].astype(str).str.strip()
+#     df["t_start"] = pd.to_numeric(df["t_start"], errors="coerce")
+#     df["duration"] = pd.to_numeric(df["duration"], errors="coerce")
+#     return df
 
 
 
-def merge_event_tables(session: str, cog_df: pd.DataFrame, dur_df: pd.DataFrame) -> pd.DataFrame:
+def merge_event_tables(session: str, cog_df: pd.DataFrame, trc_corr_df: pd.DataFrame) -> pd.DataFrame:
     """
     Fusionne la table cognitive et la table de durées d'une session.
 
@@ -656,7 +781,7 @@ def merge_event_tables(session: str, cog_df: pd.DataFrame, dur_df: pd.DataFrame)
         Nom de session.
     cog_df : pd.DataFrame
         Table d'annotations cognitives.
-    dur_df : pd.DataFrame
+    trc_corr_df : pd.DataFrame
         Table des temps exacts de début et durées.
 
     Retour
@@ -666,36 +791,36 @@ def merge_event_tables(session: str, cog_df: pd.DataFrame, dur_df: pd.DataFrame)
 
     Notes méthodologiques
     ---------------------
-    - Les temps de début fiables sont pris dans `dur_df`.
+    - Les temps de début fiables sont pris dans `trc_corr_df`.
     - Si l'ordre des labels diffère entre les deux tables, une tentative de merge
       strict par label est effectuée.
     - `group_label` et `cog_labels` sont dérivés ici, de sorte que la table exportée
       serve ensuite de référence unique pour les stats par condition.
     """
-    if len(cog_df) != len(dur_df):
+    if len(cog_df) != len(trc_corr_df):
         raise ValueError(
-            f"{session}: nombre de stimulations différent entre COG ({len(cog_df)}) et duration ({len(dur_df)})"
+            f"{session}: nombre de stimulations différent entre COG ({len(cog_df)}) et trc_corrected ({len(trc_corr_df)})"
         )
 
     cog_df = cog_df.reset_index(drop=True).copy()
-    dur_df = dur_df.reset_index(drop=True).copy()
+    trc_corr_df = trc_corr_df.reset_index(drop=True).copy()
 
     lbl1 = cog_df["label_stim"].astype(str).str.strip().tolist()
-    lbl2 = dur_df["label_stim"].astype(str).str.strip().tolist()
+    lbl2 = trc_corr_df["label_stim"].astype(str).str.strip().tolist()
 
     if lbl1 != lbl2:
         tmp = pd.merge(
-            dur_df,
+            trc_corr_df,
             cog_df[["label_stim", "lobe", "cog"]],
             on="label_stim",
             how="inner",
             validate="one_to_one",
         )
-        if len(tmp) != len(dur_df):
+        if len(tmp) != len(trc_corr_df):
             raise ValueError(f"{session}: impossible d'aligner strictement les tables événements")
         merged = tmp.copy()
     else:
-        merged = dur_df.copy()
+        merged = trc_corr_df.copy()
         merged["lobe"] = cog_df["lobe"].values
         merged["cog"] = cog_df["cog"].values
 
@@ -1165,10 +1290,12 @@ __all__ = [
 
     # Entrées / chargements
     "list_trc_sessions",
+    "read_stim_events",
+    "recover_precise_macro_stim_events",
     "find_cog_file",
-    "find_duration_file",
+    # "find_duration_file",
     "read_cog_file",
-    "read_duration_file",
+    # "read_duration_file",
     "merge_event_tables",
     "load_bad_channels_table",
     "get_bad_channels_for_session",
