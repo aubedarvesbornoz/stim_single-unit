@@ -460,13 +460,15 @@ def compute_grand_average(
 # =============================================================================
 
 def plot_grand_average_psd(
-    grand: pd.DataFrame,
+    df: pd.DataFrame,
     cfg: PSDConfig,
     yscale: str = "log",
     show_sem: bool = True,
-    title: str = "Grand-average PSD",
+    title: str = "PSD",
+    session: Optional[str] = None,
 ) -> plt.Figure:
-    """Trace les PSD grand-averaged par condition."""
+    """Trace les PSD grand-averaged par condition, pour une session ou toutes sessions confondues."""
+
     fig, ax = plt.subplots(figsize=(8, 10))
 
     styles = {
@@ -477,7 +479,7 @@ def plot_grand_average_psd(
     }
 
     for cond, style in styles.items():
-        sub = grand.loc[grand["condition"].eq(cond)].sort_values("freq_hz")
+        sub = df.loc[df["condition"].eq(cond)].sort_values("freq_hz")
         if len(sub) == 0:
             continue
         x = sub["freq_hz"].to_numpy()
@@ -491,7 +493,10 @@ def plot_grand_average_psd(
 
     ax.set_xlabel("Fréquence (Hz)")
     ax.set_ylabel("PSD (V²/Hz)")
-    ax.set_title(title)
+    if session is None:
+        ax.set_title(title)
+    else:
+        ax.set_title(f"PSD moyenne - {session}")
     ax.set_xlim(cfg.fmin, cfg.fmax)
     ax.set_yscale(yscale)
     ax.legend(frameon=False)
@@ -499,8 +504,18 @@ def plot_grand_average_psd(
     fig.tight_layout()
 
     if cfg.save_figures:
-        ensure_dir(Path(cfg.output_dir) / "figures")
-        fig.savefig(Path(cfg.output_dir) / "figures" / f"grand_average_psd__pre={cfg.pre_length}s_post={cfg.post_length}s.png", dpi=300)
+        # ensure_dir(Path(cfg.output_dir) / "figures")
+        # fig.savefig(Path(cfg.output_dir) / "figures" / f"grand_average_psd__pre={cfg.pre_length}s_post={cfg.post_length}s.png", dpi=300)
+
+        if session is None: # toutes sessions confondues
+            out_dir = Path(cfg.output_dir) / "figures"
+            fname = f"grand_average_psd__pre={cfg.pre_length}s_post={cfg.post_length}s.png"
+        else: # pour une session seule
+            out_dir = Path(cfg.output_dir) / "session_figures"
+            fname = f"average_psd_{session}__pre={cfg.pre_length}s_post={cfg.post_length}s.png"
+
+        ensure_dir(out_dir)
+        fig.savefig(out_dir / fname, dpi=300)
 
     return fig
 
@@ -538,8 +553,9 @@ def run_psd_pipeline(
             tab = compute_session_psd(session, cfg)
             if len(tab) > 0: # si on a au moins une stim a partir de laquelle calculer des PSD
                 if cfg.save_session_averages: # si on veut exporter le psd de la session seule 
-                    export_session_average_psd(tab, cfg, session, average_first=average_first)
-                all_tables.append(tab)
+                    session_avg = export_session_average_psd(tab, cfg, session, average_first=average_first) # calcul PSD sur la session
+                    plot_grand_average_psd(session_avg, cfg, session=session) # plot sur la session
+                all_tables.append(tab) # ajout PSD de la session à la table générale
         except Exception as exc:
             log(f"[ERROR] {session}: {type(exc).__name__}: {exc}", cfg.verbose)
 
