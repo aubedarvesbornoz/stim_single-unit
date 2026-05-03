@@ -539,11 +539,13 @@ def read_stim_events(path: str | Path) -> pd.DataFrame:
     Compatible séparateurs tab, virgule, point-virgule ou espaces.
     """
     path = Path(path)
-
-    df = pd.read_csv(path, sep=None, engine="python")
-
-    expected = ["label_stim", "t_start", "duration"]
-    if list(df.columns[:3]) != expected:
+    # print('in read stim') # ok 
+    df = pd.read_csv(path, sep=None, engine="python", header=None)
+    # print(df) # ok
+    # expected = ["label_stim", "t_start", "duration"]
+    # print(df.shape) # ok
+    # if list(df.columns[:3]) != expected:
+    #     print('in if')
         # fallback si fichier sans header, car parfois noms colonnes présents, parfois absents, 
         # selon type de fichier = 3 colonnes sans nom (events TRC bruts), ou plus de colonnes, mais labellisées.
 
@@ -554,12 +556,15 @@ def read_stim_events(path: str | Path) -> pd.DataFrame:
         #     header=None,
         #     names=expected,
         # )
-        df.columns[:3] = expected
-
-    df = df[expected].copy()
+        # df.columns[:3] = expected
+    df = df.iloc[:,:3]
+    # print(df.shape)
+    df.columns = ["label_stim", "t_start", "duration"]
+    # print(df.shape)
     df["label_stim"] = df["label_stim"].astype(str)
     df["t_start"] = pd.to_numeric(df["t_start"])
     df["duration"] = pd.to_numeric(df["duration"])
+    # print(df) 
     return df
 
 
@@ -597,6 +602,8 @@ def recover_precise_macro_stim_events(
         label_stim, t_start, duration, t_end,
         correction_start, correction_end
     """
+
+    print('in merge event tables') # ok
     trc_events_path = root_dir / f"{session}_stim_events_TRC.txt"
     trc_corrected_path = root_dir / f"{session}_stim_events_TRC_corrected.txt"
     if os.path.exists(trc_corrected_path):
@@ -604,13 +611,15 @@ def recover_precise_macro_stim_events(
         return pd.read_csv(trc_corrected_path)
     
     else : # sinon on crée le fichier, en recalant les events TRC d'apres le recalage manuel des events micro, dans le référentiel micro
+        print('in trc_corrected_path not existant')  # ok
         shifted_events_path = root_dir / f"{session}_stim_events_TRC_shifted.txt"
         reshifted_events_path = root_dir / f"{session}_stim_events_TRC_re-shifted.txt"
-
+        print(shifted_events_path, reshifted_events_path) # ok
         trc = read_stim_events(trc_events_path) # events TRC originaux (start approximatif, et sans durée)
         shifted = read_stim_events(shifted_events_path) # events TRC translatés approximativement vers le référentiel micro (un decalage commun par rapport a une stim)
         reshifted = read_stim_events(reshifted_events_path) # events re-corrigés précisément/manuellement en référentiel micro 
-
+        print('event files exist?') # pas ok
+        # print(trc, shifted, reshifted)
         if not (len(trc) == len(shifted) == len(reshifted)):
             raise ValueError(
                 "Les trois fichiers n'ont pas le même nombre de stimulations : "
@@ -640,20 +649,18 @@ def recover_precise_macro_stim_events(
         correction_start = reshifted_start - shifted_start
         macro_precise_start = trc_start + correction_start
 
-        out = pd.DataFrame({
+        trc_corr = pd.DataFrame({
             "label_stim": trc["label_stim"].values,
             "t_start": macro_precise_start,
             "duration": reshifted["duration"].to_numpy(float), # la durée est juste la plus précise possible telle qu'identifiée a la main
             "t_end": macro_precise_start + reshifted["duration"].to_numpy(float), # a partir de debut et durée précis,  on a la fin précise
             "correction_start": correction_start
         })
-        
-        if output_path is not None:
-            output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            out.to_csv(output_path, sep="\t", index=False)
+        print('output file', trc_corr)
+        trc_corrected_path.parent.mkdir(parents=True, exist_ok=True)
+        trc_corr.to_csv(trc_corrected_path, sep='\t', index=False)
 
-        return out
+        return trc_corr
 
 
 def find_cog_file(root_dir: Path, session: str) -> Path:
