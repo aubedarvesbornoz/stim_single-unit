@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -76,8 +77,8 @@ class PSDConfig:
     output_dir: Path
 
     # Fenêtres temporelles autour de la stimulation.
-    pre_length: float = 5.0
-    post_length: float = 3.0
+    pre_length: float = 2.0
+    post_length: float = 2.0
     epsilon: float = 0.2
 
     # PSD Welch.
@@ -89,7 +90,7 @@ class PSDConfig:
     average: str = "mean"  # scipy.signal.welch: 'mean' ou 'median' selon version scipy
 
     # Prétraitement.
-    do_notch: bool = True
+    do_notch: bool = False
     notch_freqs: Tuple[float, ...] = (50.0, 100.0, 150.0)
     notch_q: float = 30.0
     do_highpass: bool = True
@@ -98,7 +99,7 @@ class PSDConfig:
     # Groupes inclus.
     include_cog: bool = True
     include_controle: bool = True
-    include_negatif_in_baseline: bool = True
+    include_negatif: bool = True
 
     # Sorties.
     save_tables: bool = True
@@ -236,7 +237,7 @@ def _select_trials_for_psd(trials: pd.DataFrame, cfg: PSDConfig) -> pd.DataFrame
         groups.append("cog+")
     if cfg.include_controle:
         groups.append("controle")
-    if cfg.include_negatif_in_baseline:
+    if cfg.include_negatif:
         groups.append("negatif")
 
     out = trials.loc[trials["group_label"].isin(groups)].copy()
@@ -245,110 +246,123 @@ def _select_trials_for_psd(trials: pd.DataFrame, cfg: PSDConfig) -> pd.DataFrame
 
 def compute_session_psd(session: str, cfg: PSDConfig) -> pd.DataFrame:
     """
-    Calcule les PSD pré/post d'une session TRC.
+    Calcule les PSD pré/post d'une session TRC si inexistant, sinon récupère sur disque.
 
     Retour
     ------
     pd.DataFrame
         Table longue avec les conditions : pre-EBS, post-EBS_cog, post-EBS_ctrl.
     """
-    root_dir = Path(cfg.root_dir)
-    trc_path = root_dir / f"{session}.TRC"
+    out_path = Path(cfg.output_dir) / "session_tables" / f"{safe_name(session)}_psd_long__pre={float(cfg.pre_length)}s_post={float(cfg.post_length)}s.parquet"
 
-    log(f"\n[SESSION] {session}", cfg.verbose)
+    if os.path.exists(out_path):
+        out = pd.read_parquet(out_path)
+    
+    else : 
+        root_dir = Path(cfg.root_dir)
+        trc_path = root_dir / f"{session}.TRC"
 
-    # Chargements événements.
-    cog_df = read_cog_file(find_cog_file(root_dir, session))
-    trc_corr_df = recover_precise_macro_stim_events(session, root_dir)
-    trials = merge_event_tables(session, cog_df, trc_corr_df)
-    trials = _select_trials_for_psd(trials, cfg)
+        log(f"\n[SESSION] {session}", cfg.verbose)
 
-    if len(trials) == 0:
-        log(f"[WARN] {session}: aucune stimulation cog/contrôle utilisable", cfg.verbose)
-        return pd.DataFrame()
+        # Chargements événements.
+        cog_df = read_cog_file(find_cog_file(root_dir, session))
+        trc_corr_df = recover_precise_macro_stim_events(session, root_dir)
+        trials = merge_event_tables(session, cog_df, trc_corr_df)
+        trials = _select_trials_for_psd(trials, cfg)
+        if len(trials) == 0:
+            log(f"[WARN] {session}: aucune stimulation cog/contrôle utilisable", cfg.verbose)
+            return pd.DataFrame()
 
-    # Chargement signal et montage bipolaire.
-    raw = load_trc_as_mne_raw(trc_path, verbose=cfg.verbose)
-    sfreq = float(raw.info["sfreq"])
-    mono_ch_names = list(raw.ch_names)
-    mono_data = raw.get_data()
+        # Chargement signal et montage bipolaire.
+        raw = load_trc_as_mne_raw(trc_path, verbose=cfg.verbose)
+        sfreq = float(raw.info["sfreq"])
+        mono_ch_names = list(raw.ch_names)
+        mono_data = raw.get_data()
 
-    bad_df = load_bad_channels_table(root_dir)
-    bad_channels = get_bad_channels_for_session(bad_df, session)
-    bipolar_pairs = build_adjacent_bipolar_pairs(mono_ch_names, bad_channels)
+        bad_df = load_bad_channels_table(root_dir)
+        bad_channels = get_bad_channels_for_session(bad_df, session)
+        bipolar_pairs = build_adjacent_bipolar_pairs(mono_ch_names, bad_channels)
 
-    if len(bipolar_pairs) == 0:
-        log(f"[WARN] {session}: aucun canal bipolaire adjacent valide", cfg.verbose)
-        return pd.DataFrame()
+        if len(bipolar_pairs) == 0:
+            log(f"[WARN] {session}: aucun canal bipolaire adjacent valide", cfg.verbose)
+            return pd.DataFrame()
 
-    filt = apply_filters(
-        mono_data,
-        sfreq=sfreq,
-        do_notch=cfg.do_notch,
-        notch_freqs=cfg.notch_freqs,
-        notch_q=cfg.notch_q,
-        do_highpass=cfg.do_highpass,
-        highpass_hz=cfg.highpass_hz,
-    )
-    data_bp, bp_names = make_bipolar_data(filt, mono_ch_names, bipolar_pairs)
+        filt = apply_filters(
+            mono_data,
+            sfreq=sfreq,
+            do_notch=cfg.do_notch,
+            notch_freqs=cfg.notch_freqs,
+            notch_q=cfg.notch_q,
+            do_highpass=cfg.do_highpass,
+            highpass_hz=cfg.highpass_hz,
+        )
+        data_bp, bp_names = make_bipolar_data(filt, mono_ch_names, bipolar_pairs)
 
-    # Epoching pré/post.
-    signal_duration_s = data_bp.shape[-1] / sfreq
-    trials = add_windows_to_trials(trials, cfg.pre_length, cfg.post_length, cfg.epsilon)
-    trials = keep_trials_fitting_signal(trials, signal_duration_s, verbose=cfg.verbose)
+        # Epoching pré/post.
+        signal_duration_s = data_bp.shape[-1] / sfreq
+        trials = add_windows_to_trials(trials, cfg.pre_length, cfg.post_length, cfg.epsilon)
+        trials = keep_trials_fitting_signal(trials, signal_duration_s, verbose=cfg.verbose)
 
-    if len(trials) == 0:
-        log(f"[WARN] {session}: aucune stimulation avec fenêtres complètes", cfg.verbose)
-        return pd.DataFrame()
+        if len(trials) == 0:
+            log(f"[WARN] {session}: aucune stimulation avec fenêtres complètes", cfg.verbose)
+            return pd.DataFrame()
 
-    pre_epochs, post_epochs, _, _ = extract_pre_post_epochs(
-        data_bp=data_bp,
-        sfreq=sfreq,
-        stims_df=trials,
-        pre_length=cfg.pre_length,
-        post_length=cfg.post_length,
-    )
+        pre_epochs, post_epochs, _, _ = extract_pre_post_epochs(
+            data_bp=data_bp,
+            sfreq=sfreq,
+            stims_df=trials,
+            pre_length=cfg.pre_length,
+            post_length=cfg.post_length,
+        )
 
-    # Sécurité : extract_pre_post_epochs peut ignorer des essais si tailles inattendues.
-    n_kept = min(len(trials), pre_epochs.shape[0], post_epochs.shape[0])
-    trials = trials.iloc[:n_kept].reset_index(drop=True)
-    pre_epochs = pre_epochs[:n_kept]
-    post_epochs = post_epochs[:n_kept]
+        # Sécurité : extract_pre_post_epochs peut ignorer des essais si tailles inattendues.
+        n_kept = min(len(trials), pre_epochs.shape[0], post_epochs.shape[0])
+        trials = trials.iloc[:n_kept].reset_index(drop=True)
+        pre_epochs = pre_epochs[:n_kept]
+        post_epochs = post_epochs[:n_kept]
 
-    if n_kept == 0:
-        log(f"[WARN] {session}: aucune epoch extraite", cfg.verbose)
-        return pd.DataFrame()
+        if n_kept == 0:
+            log(f"[WARN] {session}: aucune epoch extraite", cfg.verbose)
+            return pd.DataFrame()
 
-    # PSD pré : toutes les baselines incluses.
-    freqs, pre_psd = compute_epochs_psd(pre_epochs, sfreq, cfg)
-    tables = [psd_to_long_table(
-        pre_psd, freqs, session, bp_names, trials,
-        condition="pre-EBS", epoch_kind="pre",
-    )]
+        # PSD pré : toutes les baselines incluses.
+        freqs, pre_psd = compute_epochs_psd(pre_epochs, sfreq, cfg)
+        tables = [psd_to_long_table(
+            pre_psd, freqs, session, bp_names, trials,
+            condition="pre-EBS", epoch_kind="pre",
+        )]
 
-    # PSD post cog.
-    cog_mask = trials["group_label"].eq("cog+").to_numpy()
-    if cog_mask.any():
-        _, post_cog_psd = compute_epochs_psd(post_epochs[cog_mask], sfreq, cfg)
-        tables.append(psd_to_long_table(
-            post_cog_psd, freqs, session, bp_names, trials.loc[cog_mask].reset_index(drop=True),
-            condition="post-EBS_cog", epoch_kind="post",
-        ))
+        # PSD post cog.
+        cog_mask = trials["group_label"].eq("cog+").to_numpy()
+        if cog_mask.any():
+            _, post_cog_psd = compute_epochs_psd(post_epochs[cog_mask], sfreq, cfg)
+            tables.append(psd_to_long_table(
+                post_cog_psd, freqs, session, bp_names, trials.loc[cog_mask].reset_index(drop=True),
+                condition="post-EBS_cog", epoch_kind="post",
+            ))
 
-    # PSD post contrôle.
-    ctrl_mask = trials["group_label"].eq("controle").to_numpy()
-    if ctrl_mask.any():
-        _, post_ctrl_psd = compute_epochs_psd(post_epochs[ctrl_mask], sfreq, cfg)
-        tables.append(psd_to_long_table(
-            post_ctrl_psd, freqs, session, bp_names, trials.loc[ctrl_mask].reset_index(drop=True),
-            condition="post-EBS_ctrl", epoch_kind="post",
-        ))
+        # PSD post contrôle.
+        ctrl_mask = trials["group_label"].eq("controle").to_numpy()
+        if ctrl_mask.any():
+            _, post_ctrl_psd = compute_epochs_psd(post_epochs[ctrl_mask], sfreq, cfg)
+            tables.append(psd_to_long_table(
+                post_ctrl_psd, freqs, session, bp_names, trials.loc[ctrl_mask].reset_index(drop=True),
+                condition="post-EBS_ctrl", epoch_kind="post",
+            ))
 
-    out = pd.concat([t for t in tables if len(t) > 0], ignore_index=True)
+        # PSD post négatif.
+        neg_mask = trials["group_label"].eq("negatif").to_numpy()
+        if neg_mask.any():
+            _, post_neg_psd = compute_epochs_psd(post_epochs[neg_mask], sfreq, cfg)
+            tables.append(psd_to_long_table(
+                post_neg_psd, freqs, session, bp_names, trials.loc[neg_mask].reset_index(drop=True),
+                condition="post-EBS_neg", epoch_kind="post",
+            ))
 
-    if cfg.save_tables:
-        ensure_dir(Path(cfg.output_dir) / "session_tables")
-        out.to_parquet(Path(cfg.output_dir) / "session_tables" / f"{safe_name(session)}_psd_long.parquet", index=False)
+        out = pd.concat([t for t in tables if len(t) > 0], ignore_index=True)
+        if cfg.save_tables:
+            ensure_dir(Path(cfg.output_dir) / "session_tables")
+            out.to_parquet(out_path, index=False)
 
     return out
 
@@ -400,7 +414,6 @@ def compute_grand_average(
         unit_cols = ["condition", "freq_hz"]
     else:
         raise ValueError("average_first doit être 'trial_channel', 'session' ou 'session_channel'")
-
     grand = (
         tmp.groupby(unit_cols)["psd_v2_hz"]
         .agg(mean_psd_v2_hz="mean", sd_psd_v2_hz="std", n_units="count")
@@ -408,42 +421,6 @@ def compute_grand_average(
     )
     grand["sem_psd_v2_hz"] = grand["sd_psd_v2_hz"] / np.sqrt(grand["n_units"].clip(lower=1))
     return grand
-
-
-def add_relative_to_pre_baseline(
-    grand: pd.DataFrame,
-    mode: str = "db",
-) -> pd.DataFrame:
-    """
-    Ajoute une PSD relative à la condition pre-EBS.
-
-    Modes
-    -----
-    - 'db'      : 10 * log10(condition / pre-EBS)
-    - 'percent' : 100 * (condition - pre-EBS) / pre-EBS
-    - 'ratio'   : condition / pre-EBS
-    """
-    if len(grand) == 0:
-        return grand.copy()
-
-    base = grand.loc[grand["condition"].eq("pre-EBS"), ["freq_hz", "mean_psd_v2_hz"]]
-    base = base.rename(columns={"mean_psd_v2_hz": "pre_mean_psd_v2_hz"})
-    out = grand.merge(base, on="freq_hz", how="left")
-
-    eps = np.finfo(float).tiny
-    ratio = out["mean_psd_v2_hz"] / np.maximum(out["pre_mean_psd_v2_hz"], eps)
-
-    if mode == "db":
-        out["psd_relative"] = 10.0 * np.log10(np.maximum(ratio, eps))
-    elif mode == "percent":
-        out["psd_relative"] = 100.0 * (ratio - 1.0)
-    elif mode == "ratio":
-        out["psd_relative"] = ratio
-    else:
-        raise ValueError("mode doit être 'db', 'percent' ou 'ratio'")
-
-    out["relative_mode"] = mode
-    return out
 
 
 # =============================================================================
@@ -456,22 +433,29 @@ def plot_grand_average_psd(
     yscale: str = "log",
     show_sem: bool = True,
     title: str = "Grand-average PSD",
-    save_name: str = "grand_average_psd.png",
 ) -> plt.Figure:
     """Trace les PSD grand-averaged par condition."""
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(8, 12))
 
-    order = ["pre-EBS", "post-EBS_ctrl", "post-EBS_cog"]
-    for cond in order:
+    styles = {
+        "pre-EBS": {"label": "pre-EBS", "color": "gray"},
+        "post-EBS_cog": {"label": "post-EBS cog", "color": "green"},
+        "post-EBS_ctrl": {"label": "post-EBS contrôle", "color": "blue"},
+        "post-EBS_neg": {"label": "post-EBS négatif", "color": "red"},
+    }
+
+    for cond, style in styles.items():
         sub = grand.loc[grand["condition"].eq(cond)].sort_values("freq_hz")
         if len(sub) == 0:
             continue
         x = sub["freq_hz"].to_numpy()
         y = sub["mean_psd_v2_hz"].to_numpy()
-        ax.plot(x, y, label=cond)
+
+        n = int(sub["n_units"].iloc[0]) # n = nombre de trials par condition
+        ax.plot(x, y, label=f"{style['label']} (n={n})", color=style["color"]) 
         if show_sem and "sem_psd_v2_hz" in sub:
             sem = sub["sem_psd_v2_hz"].to_numpy()
-            ax.fill_between(x, y - sem, y + sem, alpha=0.2)
+            ax.fill_between(x, y - sem, y + sem, alpha=0.2, color=style["color"])
 
     ax.set_xlabel("Fréquence (Hz)")
     ax.set_ylabel("PSD (V²/Hz)")
@@ -484,42 +468,7 @@ def plot_grand_average_psd(
 
     if cfg.save_figures:
         ensure_dir(Path(cfg.output_dir) / "figures")
-        fig.savefig(Path(cfg.output_dir) / "figures" / save_name, dpi=300)
-
-    return fig
-
-
-def plot_relative_psd(
-    relative: pd.DataFrame,
-    cfg: PSDConfig,
-    include_pre: bool = False,
-    title: str = "PSD relative à pre-EBS",
-    save_name: str = "grand_average_psd_relative.png",
-) -> plt.Figure:
-    """Trace les conditions post en relatif à pre-EBS."""
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    order = ["pre-EBS", "post-EBS_ctrl", "post-EBS_cog"] if include_pre else ["post-EBS_ctrl", "post-EBS_cog"]
-    for cond in order:
-        sub = relative.loc[relative["condition"].eq(cond)].sort_values("freq_hz")
-        if len(sub) == 0:
-            continue
-        ax.plot(sub["freq_hz"], sub["psd_relative"], label=cond)
-
-    mode = str(relative["relative_mode"].iloc[0]) if len(relative) else "db"
-    ylabel = {"db": "PSD relative (dB)", "percent": "Variation vs pre-EBS (%)", "ratio": "Ratio vs pre-EBS"}.get(mode, mode)
-    ax.axhline(0.0 if mode in {"db", "percent"} else 1.0, linestyle="--", linewidth=1)
-    ax.set_xlabel("Fréquence (Hz)")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.set_xlim(cfg.fmin, cfg.fmax)
-    ax.legend(frameon=False)
-    ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-
-    if cfg.save_figures:
-        ensure_dir(Path(cfg.output_dir) / "figures")
-        fig.savefig(Path(cfg.output_dir) / "figures" / save_name, dpi=300)
+        fig.savefig(Path(cfg.output_dir) / "figures" / f"grand_average_psd__pre={cfg.pre_length}s_post={cfg.post_length}s.png", dpi=300)
 
     return fig
 
@@ -531,7 +480,7 @@ def plot_relative_psd(
 def run_psd_pipeline(
     cfg: PSDConfig,
     sessions: Optional[Sequence[str]] = None,
-    average_first: str = "session_channel",
+    average_first: str = "trial_channel",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Lance l'analyse PSD sur plusieurs sessions.
@@ -543,6 +492,7 @@ def run_psd_pipeline(
     grand : pd.DataFrame
         Grand average par condition × fréquence.
     """
+
     cfg.root_dir = Path(cfg.root_dir)
     cfg.output_dir = Path(cfg.output_dir)
     ensure_dir(cfg.output_dir)
@@ -566,9 +516,8 @@ def run_psd_pipeline(
     grand = compute_grand_average(all_psd, average_first=average_first)
 
     if cfg.save_tables:
-        all_psd.to_parquet(cfg.output_dir / "all_sessions_psd_long.parquet", index=False)
-        grand.to_csv(cfg.output_dir / "grand_average_psd.csv", index=False)
-
+        all_psd.to_parquet(cfg.output_dir / f"all_sessions_psd_long__pre={float(cfg.pre_length)}s_post={float(cfg.post_length)}s.parquet", index=False)
+        grand.to_csv(cfg.output_dir / f"grand_average_psd__pre={float(cfg.pre_length)}s_post={float(cfg.post_length)}s.csv", index=False)
     return all_psd, grand
 
 
@@ -578,8 +527,6 @@ __all__ = [
     "psd_to_long_table",
     "compute_session_psd",
     "compute_grand_average",
-    "add_relative_to_pre_baseline",
     "plot_grand_average_psd",
-    "plot_relative_psd",
     "run_psd_pipeline",
 ]

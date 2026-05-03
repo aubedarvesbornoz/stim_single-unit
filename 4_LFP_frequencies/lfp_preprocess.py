@@ -603,12 +603,12 @@ def recover_precise_macro_stim_events(
         correction_start, correction_end
     """
 
-    print('in merge event tables') # ok
+    # print('in merge event tables') # ok
     trc_events_path = root_dir / f"{session}_stim_events_TRC.txt"
     trc_corrected_path = root_dir / f"{session}_stim_events_TRC_corrected.txt"
     if os.path.exists(trc_corrected_path):
         # le fichier a déjà été créé auparavant
-        return pd.read_csv(trc_corrected_path)
+        return pd.read_csv(trc_corrected_path,sep='\t')
     
     else : # sinon on crée le fichier, en recalant les events TRC d'apres le recalage manuel des events micro, dans le référentiel micro
         print('in trc_corrected_path not existant')  # ok
@@ -656,7 +656,7 @@ def recover_precise_macro_stim_events(
             "t_end": macro_precise_start + reshifted["duration"].to_numpy(float), # a partir de debut et durée précis,  on a la fin précise
             "correction_start": correction_start
         })
-        print('output file', trc_corr)
+        # print('output file', trc_corr)
         trc_corrected_path.parent.mkdir(parents=True, exist_ok=True)
         trc_corr.to_csv(trc_corrected_path, sep='\t', index=False)
 
@@ -717,7 +717,7 @@ def read_cog_file(cog_file: Path) -> pd.DataFrame:
 
     Format attendu
     --------------
-    stim ; t_start ; duration ; lobe ; cog
+    stim ; t_start ; duration ; (lobe) ; cog
 
     Paramètres
     ----------
@@ -732,17 +732,17 @@ def read_cog_file(cog_file: Path) -> pd.DataFrame:
 
     Notes
     -----
-    Les `t_start` contenus dans ce fichier peuvent être incorrects ; seuls l'ordre
-    et l'annotation cognitive sont utilisés comme source primaire ici.
+    Les `t_start` contenus dans ce fichier peuvent être incorrects (référentiel micro, pas macro); 
+    seuls l'ordre des labels et l'annotation cognitive sont utilisés ici.
     """
     df = pd.read_csv(cog_file, sep=";", dtype=str)
-    expected = {"stim", "t_start", "duration", "lobe", "cog"}
-    missing = expected - set(df.columns)
-    if missing:
-        raise ValueError(f"Colonnes manquantes dans {cog_file.name}: {missing}")
+    # expected = {"stim", "t_start", "duration", "lobe", "cog"}
+    # missing = expected - set(df.columns)
+    # if missing:
+    #     raise ValueError(f"Colonnes manquantes dans {cog_file.name}: {missing}")
 
-    df = df.rename(columns={"stim": "label_stim", "cog": "cog"})
-    return df[["label_stim", "t_start", "duration", "lobe", "cog"]].copy()
+    df = df.rename(columns={"stim": "label_stim"})
+    return df
 
 
 
