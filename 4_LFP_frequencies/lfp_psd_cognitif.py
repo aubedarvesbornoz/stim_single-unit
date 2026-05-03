@@ -101,6 +101,10 @@ class PSDConfig:
     include_controle: bool = True
     include_negatif: bool = True
 
+    # Par session individuelle en plus.
+    save_session_averages: bool = True
+    overwrite_session_averages: bool = False
+
     # Sorties.
     save_tables: bool = True
     save_figures: bool = True
@@ -367,6 +371,34 @@ def compute_session_psd(session: str, cfg: PSDConfig) -> pd.DataFrame:
     return out
 
 
+def export_session_average_psd(
+    psd_long: pd.DataFrame,
+    cfg: PSDConfig,
+    session: str,
+    average_first: str = "trial_channel",
+) -> pd.DataFrame:
+    """
+    Crée et exporte la PSD moyenne d'une session individuelle,
+    sauf si elle existe déjà.
+    """
+    out_dir = Path(cfg.output_dir) / "session_averages"
+    ensure_dir(out_dir)
+
+    out_csv = out_dir / f"{safe_name(session)}_average_psd.csv"
+
+    if out_csv.exists() and not cfg.overwrite_session_averages:
+        log(f"[INFO] {session}: PSD moyenne session déjà créée, skip", cfg.verbose)
+        return pd.read_csv(out_csv)
+
+    session_avg = compute_grand_average(psd_long, average_first=average_first)
+    session_avg.insert(0, "session", session)
+
+    if cfg.save_tables:
+        session_avg.to_csv(out_csv, index=False)
+
+    return session_avg
+
+
 # =============================================================================
 # GRAND AVERAGE
 # =============================================================================
@@ -435,7 +467,7 @@ def plot_grand_average_psd(
     title: str = "Grand-average PSD",
 ) -> plt.Figure:
     """Trace les PSD grand-averaged par condition."""
-    fig, ax = plt.subplots(figsize=(8, 12))
+    fig, ax = plt.subplots(figsize=(8, 10))
 
     styles = {
         "pre-EBS": {"label": "pre-EBS", "color": "gray"},
@@ -504,7 +536,9 @@ def run_psd_pipeline(
     for session in sessions:
         try:
             tab = compute_session_psd(session, cfg)
-            if len(tab) > 0:
+            if len(tab) > 0: # si on a au moins une stim a partir de laquelle calculer des PSD
+                if cfg.save_session_averages: # si on veut exporter le psd de la session seule 
+                    export_session_average_psd(tab, cfg, session, average_first=average_first)
                 all_tables.append(tab)
         except Exception as exc:
             log(f"[ERROR] {session}: {type(exc).__name__}: {exc}", cfg.verbose)
@@ -526,6 +560,7 @@ __all__ = [
     "compute_epochs_psd",
     "psd_to_long_table",
     "compute_session_psd",
+    "export_session_average_psd",
     "compute_grand_average",
     "plot_grand_average_psd",
     "run_psd_pipeline",
