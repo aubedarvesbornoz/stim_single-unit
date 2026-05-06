@@ -658,7 +658,8 @@ def quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, 
         analyzer.compute("noise_levels")
         
         qm = analyzer.compute("quality_metrics").get_data() # Récupération du tableau de QM
-        qm = qm[list_col_qm]
+        list_col_qm_exported = [col for col in list_col_qm if col in list(qm.columns)]
+        qm = qm[list_col_qm_exported]
 
         # -----------------------------
         # Remapping des IDs d'unités
@@ -773,8 +774,9 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
     pre_duration, post_duration = 10, 10  # sec
     
     # on charge les quality metrics de chaque SU de la session
+    qm = quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, dict_clu2tt, root)#[list_col_qm]
     list_col_qm = ['amplitude_median', 'num_spikes', 'presence_ratio', 'amplitude_cutoff', 'snr', 'isi_violations_ratio']
-    qm = quality_metrics_session(patient, session, mapping_anat, dict_elec2deadfile, dict_clu2tt, root)[list_col_qm]
+    list_col_qm_exported = [col for col in list_col_qm if col in list(qm.columns)]
 
     # --- Chargement éventuel d'un fichier de stim avec colonne cognitive ("cog") ---
     # Ce fichier, s'il existe, correspond ligne à ligne à stims_loca
@@ -812,10 +814,10 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
         
         # ajout des quality metrics :
         if clu in list(qm.index):
-            for metric in list_col_qm:
+            for metric in list_col_qm_exported:
                 row_unit[metric] = qm.loc[clu, metric]
         else:
-            for metric in list_col_qm:
+            for metric in list_col_qm_exported:
                 row_unit[metric] = np.nan
 
         # fr_global / Taux de décharge global :
