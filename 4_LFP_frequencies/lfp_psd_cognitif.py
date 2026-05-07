@@ -251,6 +251,7 @@ def _select_trials_for_psd(trials: pd.DataFrame, cfg: PSDConfig) -> pd.DataFrame
 def compute_session_psd(session: str, cfg: PSDConfig) -> pd.DataFrame:
     """
     Calcule les PSD pré/post d'une session TRC si inexistant, sinon récupère sur disque.
+    Tourne sur toutes les portions d'une session si elle est divisée en plusieurs portions.
 
     Retour
     ------
@@ -277,93 +278,140 @@ def compute_session_psd(session: str, cfg: PSDConfig) -> pd.DataFrame:
             log(f"[WARN] {session}: aucune stimulation cog/contrôle utilisable", cfg.verbose)
             return pd.DataFrame()
 
-        # Chargement signal et montage bipolaire.
-        raw = load_trc_as_mne_raw(trc_path, verbose=cfg.verbose)
-        sfreq = float(raw.info["sfreq"])
-        mono_ch_names = list(raw.ch_names)
-        mono_data = raw.get_data()
-
         bad_df = load_bad_channels_table(root_dir)
-        bad_channels = get_bad_channels_for_session(bad_df, session)
-        bipolar_pairs = build_adjacent_bipolar_pairs(mono_ch_names, bad_channels)
+        session_tables = []
 
-        if len(bipolar_pairs) == 0:
-            log(f"[WARN] {session}: aucun canal bipolaire adjacent valide", cfg.verbose)
+        for macro_part, part_trials in trials.groupby("macro_part", sort=False):
+            part_trials = part_trials.reset_index(drop=True)
+
+            trc_path = root_dir / f"{macro_part}.TRC"
+            if not trc_path.exists():
+                raise FileNotFoundError(f"TRC partiel introuvable : {trc_path}")
+
+            log(f"[INFO] {session}: chargement fragment macro {macro_part}", cfg.verbose)
+
+            # Chargement signal, montage bipolaire, filtre.
+            raw = load_trc_as_mne_raw(trc_path, verbose=cfg.verbose)
+            sfreq = float(raw.info["sfreq"])
+            mono_ch_names = list(raw.ch_names)
+            mono_data = raw.get_data()
+
+            bad_channels = get_bad_channels_for_session(bad_df, macro_part)
+            if len(bad_channels) == 0:
+                bad_channels = get_bad_channels_for_session(bad_df, session)
+
+            bipolar_pairs = build_adjacent_bipolar_pairs(mono_ch_names, bad_channels)
+            if len(bipolar_pairs) == 0:
+                log(f"[WARN] {macro_part}: aucun canal bipolaire adjacent valide", cfg.verbose)
+                continue
+
+            filt = apply_filters(
+                mono_data,
+                sfreq=sfreq,
+                do_notch=cfg.do_notch,
+                notch_freqs=cfg.notch_freqs,
+                notch_q=cfg.notch_q,
+                do_highpass=cfg.do_highpass,
+                highpass_hz=cfg.highpass_hz,
+            )
+
+            data_bp, bp_names = make_bipolar_data(filt, mono_ch_names, bipolar_pairs)
+
+            # Epoching pré/post.
+            signal_duration_s = data_bp.shape[-1] / sfreq
+            part_trials = add_windows_to_trials(
+                part_trials,
+                cfg.pre_length,
+                cfg.post_length,
+                cfg.epsilon,
+            )
+            part_trials = keep_trials_fitting_signal(
+                part_trials,
+                signal_duration_s,
+                verbose=cfg.verbose,
+            )
+
+            if len(part_trials) == 0:
+                log(f"[WARN] {macro_part}: aucune stimulation avec fenêtres complètes", cfg.verbose)
+                continue
+
+            pre_epochs, post_epochs, _, _ = extract_pre_post_epochs(
+                data_bp=data_bp,
+                sfreq=sfreq,
+                stims_df=part_trials,
+                pre_length=cfg.pre_length,
+                post_length=cfg.post_length,
+            )
+
+            n_kept = min(len(part_trials), pre_epochs.shape[0], post_epochs.shape[0])
+            part_trials = part_trials.iloc[:n_kept].reset_index(drop=True)
+            pre_epochs = pre_epochs[:n_kept]
+            post_epochs = post_epochs[:n_kept]
+
+            if n_kept == 0:
+                continue
+
+            # PSD pré : toutes les baselines incluses.
+            freqs, pre_psd = compute_epochs_psd(pre_epochs, sfreq, cfg)
+            tables = [
+                psd_to_long_table(
+                    pre_psd,
+                    freqs,
+                    session,
+                    bp_names,
+                    part_trials,
+                    condition="pre-EBS",
+                    epoch_kind="pre")]
+
+            # PSD post cog.
+            cog_mask = part_trials["group_label"].eq("cog+").to_numpy()
+            if cog_mask.any():
+                _, post_cog_psd = compute_epochs_psd(post_epochs[cog_mask], sfreq, cfg)
+                tables.append(psd_to_long_table(
+                    post_cog_psd,
+                    freqs,
+                    session,
+                    bp_names,
+                    part_trials.loc[cog_mask].reset_index(drop=True),
+                    condition="post-EBS_cog",
+                    epoch_kind="post"))
+
+            # PSD post contrôle.
+            ctrl_mask = part_trials["group_label"].eq("controle").to_numpy()
+            if ctrl_mask.any():
+                _, post_ctrl_psd = compute_epochs_psd(post_epochs[ctrl_mask], sfreq, cfg)
+                tables.append(psd_to_long_table(
+                    post_ctrl_psd,
+                    freqs,
+                    session,
+                    bp_names,
+                    part_trials.loc[ctrl_mask].reset_index(drop=True),
+                    condition="post-EBS_ctrl",
+                    epoch_kind="post",
+                ))
+
+            # PSD post négatif.
+            neg_mask = part_trials["group_label"].eq("negatif").to_numpy()
+            if neg_mask.any():
+                _, post_neg_psd = compute_epochs_psd(post_epochs[neg_mask], sfreq, cfg)
+                tables.append(psd_to_long_table(
+                    post_neg_psd,
+                    freqs,
+                    session,
+                    bp_names,
+                    part_trials.loc[neg_mask].reset_index(drop=True),
+                    condition="post-EBS_neg",
+                    epoch_kind="post"))
+
+            part_out = pd.concat(tables, ignore_index=True)
+            part_out["macro_part"] = macro_part
+            session_tables.append(part_out)
+
+        if not session_tables:
             return pd.DataFrame()
 
-        filt = apply_filters(
-            mono_data,
-            sfreq=sfreq,
-            do_notch=cfg.do_notch,
-            notch_freqs=cfg.notch_freqs,
-            notch_q=cfg.notch_q,
-            do_highpass=cfg.do_highpass,
-            highpass_hz=cfg.highpass_hz,
-        )
-        data_bp, bp_names = make_bipolar_data(filt, mono_ch_names, bipolar_pairs)
+        out = pd.concat(session_tables, ignore_index=True)
 
-        # Epoching pré/post.
-        signal_duration_s = data_bp.shape[-1] / sfreq
-        trials = add_windows_to_trials(trials, cfg.pre_length, cfg.post_length, cfg.epsilon)
-        trials = keep_trials_fitting_signal(trials, signal_duration_s, verbose=cfg.verbose)
-
-        if len(trials) == 0:
-            log(f"[WARN] {session}: aucune stimulation avec fenêtres complètes", cfg.verbose)
-            return pd.DataFrame()
-
-        pre_epochs, post_epochs, _, _ = extract_pre_post_epochs(
-            data_bp=data_bp,
-            sfreq=sfreq,
-            stims_df=trials,
-            pre_length=cfg.pre_length,
-            post_length=cfg.post_length,
-        )
-
-        # Sécurité : extract_pre_post_epochs peut ignorer des essais si tailles inattendues.
-        n_kept = min(len(trials), pre_epochs.shape[0], post_epochs.shape[0])
-        trials = trials.iloc[:n_kept].reset_index(drop=True)
-        pre_epochs = pre_epochs[:n_kept]
-        post_epochs = post_epochs[:n_kept]
-
-        if n_kept == 0:
-            log(f"[WARN] {session}: aucune epoch extraite", cfg.verbose)
-            return pd.DataFrame()
-
-        # PSD pré : toutes les baselines incluses.
-        freqs, pre_psd = compute_epochs_psd(pre_epochs, sfreq, cfg)
-        tables = [psd_to_long_table(
-            pre_psd, freqs, session, bp_names, trials,
-            condition="pre-EBS", epoch_kind="pre",
-        )]
-
-        # PSD post cog.
-        cog_mask = trials["group_label"].eq("cog+").to_numpy()
-        if cog_mask.any():
-            _, post_cog_psd = compute_epochs_psd(post_epochs[cog_mask], sfreq, cfg)
-            tables.append(psd_to_long_table(
-                post_cog_psd, freqs, session, bp_names, trials.loc[cog_mask].reset_index(drop=True),
-                condition="post-EBS_cog", epoch_kind="post",
-            ))
-
-        # PSD post contrôle.
-        ctrl_mask = trials["group_label"].eq("controle").to_numpy()
-        if ctrl_mask.any():
-            _, post_ctrl_psd = compute_epochs_psd(post_epochs[ctrl_mask], sfreq, cfg)
-            tables.append(psd_to_long_table(
-                post_ctrl_psd, freqs, session, bp_names, trials.loc[ctrl_mask].reset_index(drop=True),
-                condition="post-EBS_ctrl", epoch_kind="post",
-            ))
-
-        # PSD post négatif.
-        neg_mask = trials["group_label"].eq("negatif").to_numpy()
-        if neg_mask.any():
-            _, post_neg_psd = compute_epochs_psd(post_epochs[neg_mask], sfreq, cfg)
-            tables.append(psd_to_long_table(
-                post_neg_psd, freqs, session, bp_names, trials.loc[neg_mask].reset_index(drop=True),
-                condition="post-EBS_neg", epoch_kind="post",
-            ))
-
-        out = pd.concat([t for t in tables if len(t) > 0], ignore_index=True)
         if cfg.save_tables:
             ensure_dir(Path(cfg.output_dir) / "session_tables")
             out.to_parquet(out_path, index=False)
@@ -424,6 +472,8 @@ def compute_grand_average(
     pd.DataFrame
         Colonnes : condition, freq_hz, mean_psd_v2_hz, sem_psd_v2_hz, n_units.
     """
+    print("in compue gd av, psd long=", psd_long.shape)
+    print(psd_long)
     if len(psd_long) == 0:
         return pd.DataFrame()
 

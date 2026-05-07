@@ -531,6 +531,28 @@ def list_trc_sessions(root_dir: Path) -> List[str]:
     return sorted(set(sessions))
 
 
+def find_trc_parts(root_dir: Path, session: str) -> List[Path]:
+    """
+    Trouve les fichiers TRC correspondant à une session logique.
+
+    Cas simple :
+        session.TRC
+
+    Cas fragmenté :
+        sessiona.TRC, sessionb.TRC, sessionc.TRC...
+    """
+    single = root_dir / f"{session}.TRC"
+    if single.exists():
+        return [single]
+
+    parts = sorted(root_dir.glob(f"{session}*.TRC"))
+
+    if len(parts) == 0:
+        raise FileNotFoundError(f"Aucun fichier TRC trouvé pour {session}")
+
+    return parts
+
+
 def read_stim_events(path: str | Path) -> pd.DataFrame:
     """
     Lit un fichier stim_events avec colonnes :
@@ -566,6 +588,51 @@ def read_stim_events(path: str | Path) -> pd.DataFrame:
     df["duration"] = pd.to_numeric(df["duration"])
     # print(df) 
     return df
+
+
+def find_trc_event_parts(root_dir: Path, session: str) -> List[Path]:
+    """
+    Trouve les fichiers d'events TRC bruts correspondant à une session logique.
+    (puisque parfois une session est divisée en plusieurs TRC)
+    """
+    single = root_dir / f"{session}_stim_events_TRC.txt"
+    if single.exists():
+        return [single]
+
+    parts = sorted(root_dir.glob(f"{session}*_stim_events_TRC.txt"))
+
+    parts = [
+        fp for fp in parts
+        if "_shifted" not in fp.name
+        and "_re-shifted" not in fp.name
+        and "_corrected" not in fp.name
+    ]
+
+    if len(parts) == 0:
+        raise FileNotFoundError(f"Aucun fichier events TRC brut trouvé pour {session}")
+
+    return parts
+
+
+def read_concat_trc_event_parts(root_dir: Path, session: str) -> pd.DataFrame:
+    """
+    Lit les fichiers events TRC bruts partiels et les concatène
+    dans l'ordre macro.
+    """
+    event_parts = find_trc_event_parts(root_dir, session)
+
+    dfs = []
+    for part_idx, fp in enumerate(event_parts):
+        df = read_stim_events(fp)
+
+        macro_part = fp.name.replace("_stim_events_TRC.txt", "")
+        df["macro_part"] = macro_part
+        df["macro_part_index"] = part_idx
+        df["macro_event_index"] = np.arange(len(df), dtype=int)
+
+        dfs.append(df)
+
+    return pd.concat(dfs, ignore_index=True)
 
 
 def recover_precise_macro_stim_events(
@@ -604,7 +671,6 @@ def recover_precise_macro_stim_events(
     """
 
     # print('in merge event tables') # ok
-    trc_events_path = root_dir / f"{session}_stim_events_TRC.txt"
     trc_corrected_path = root_dir / f"{session}_stim_events_TRC_corrected.txt"
     if os.path.exists(trc_corrected_path):
         # le fichier a déjà été créé auparavant
@@ -615,7 +681,10 @@ def recover_precise_macro_stim_events(
         shifted_events_path = root_dir / f"{session}_stim_events_TRC_shifted.txt"
         reshifted_events_path = root_dir / f"{session}_stim_events_TRC_re-shifted.txt"
         print(shifted_events_path, reshifted_events_path) # ok
-        trc = read_stim_events(trc_events_path) # events TRC originaux (start approximatif, et sans durée)
+        
+        # trc_events_path = root_dir / f"{session}_stim_events_TRC.txt"
+        # trc = read_stim_events(trc_events_path) # events TRC originaux (start approximatif, et sans durée)
+        trc = read_concat_trc_event_parts(root_dir, session)
         shifted = read_stim_events(shifted_events_path) # events TRC translatés approximativement vers le référentiel micro (un decalage commun par rapport a une stim)
         reshifted = read_stim_events(reshifted_events_path) # events re-corrigés précisément/manuellement en référentiel micro 
         print('event files exist?') # pas ok
@@ -654,7 +723,10 @@ def recover_precise_macro_stim_events(
             "t_start": macro_precise_start,
             "duration": reshifted["duration"].to_numpy(float), # la durée est juste la plus précise possible telle qu'identifiée a la main
             "t_end": macro_precise_start + reshifted["duration"].to_numpy(float), # a partir de debut et durée précis,  on a la fin précise
-            "correction_start": correction_start
+            "correction_start": correction_start, 
+            "macro_part": trc["macro_part"].values, # par exemple P107_SG60_stim2b
+            "macro_part_index": trc["macro_part_index"].values,
+            "macro_event_index": trc["macro_event_index"].values,
         })
         # print('output file', trc_corr)
         trc_corrected_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1297,7 +1369,10 @@ __all__ = [
 
     # Entrées / chargements
     "list_trc_sessions",
+    "find_trc_parts",
     "read_stim_events",
+    "find_trc_event_parts",
+    "read_concat_trc_event_parts",
     "recover_precise_macro_stim_events",
     "find_cog_file",
     # "find_duration_file",
