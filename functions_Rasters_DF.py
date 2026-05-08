@@ -786,7 +786,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
         stims_with_cog = pd.read_csv(path_cog, sep=';')
         cog_by_stim = stims_with_cog['cog'].apply(lambda x: np.nan if pd.isna(x) or str(x).strip() == '' else ast.literal_eval(x))
     else:
-        cog_by_stim = pd.DataFrame([np.nan for _ in range(stims_loca.shape[0])])
+        cog_by_stim = pd.DataFrame([np.nan for _ in range(stims_loca.shape[0])],columns=['cog'])
 
     # --- Chargement éventuel d'un fichier de stim avec colonne "post_decharge" ---
     # Ce fichier, s'il existe, correspond ligne à ligne à stims_loca
@@ -930,7 +930,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
                         'stim_Lobe': stim_Lobe, 'stim_Lobe_noLat' : remove_laterality(stim_Lobe),
                         'stim_in_ZE': stimZE, 'stim_in_ZI': stimZI, 'stim_in_ZP': stimZP, 'stim_in_ZL': stimZL, 'stim_in_NI': stimNI,
                         'freq_stim': int(stim['frequence'].strip()[:-3]), 'intensity_stim': float(stim['intensite'].strip()[:-3]), 
-                        'cog': cog_by_stim.loc[i], #'after_discharge':[True if type(AD_by_stim.loc[i])==list else False][0], # AD vrai s'il y a une AD avec cette stim
+                        'cog': cog_by_stim.loc[i,'cog'], #'after_discharge':[True if type(AD_by_stim.loc[i])==list else False][0], # AD vrai s'il y a une AD avec cette stim
                         'after_discharge_loc': [True if dict_clu2tt[clu] in AD_by_stim.loc[i] else False][0], # AD local vrai si tetrode dans liste de tetrodes concernées par une AD 
 
                         # Topographie : sameElec, sameLobe / Distance avec la stim / stim ou tt en ZE,ZI,ZP,ZL,NI 
