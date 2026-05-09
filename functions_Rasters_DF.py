@@ -1086,8 +1086,8 @@ def update_general_summary_on_all_sessions(root='D:/'):
         all_summaries_nrn.append(df_summary_nrn)
 
     # Empile tous les dataframes de type summary
-    big_df_trials = pd.concat(all_summaries_trials, axis=1, ignore_index=True)
-    big_df_by_nrn = pd.concat(all_summaries_nrn, axis=1, ignore_index=True)
+    big_df_trials = pd.concat(all_summaries_trials, axis=0, ignore_index=True)
+    big_df_by_nrn = pd.concat(all_summaries_nrn, axis=0, ignore_index=True)
 
     # Export des dataframes generaux
     big_df_trials.to_excel(root+"Spike-sorting/Tables/general_summary_all_sessions.xlsx", index=False)
