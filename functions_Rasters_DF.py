@@ -175,9 +175,9 @@ def normalize_name(name: str) -> str:
 
     # --- Cas macro (majuscules, avec suffixe éventuel) ---
     # On tolère formats : "ABCp", "ABC_p", "ABC'", "ABC", "ABC_"
-    if re.match(r"^[A-Z]{1,3}(_?p|_|'|)$", name):
+    if re.match(r"^[A-Z]{1,3}(_p|_|'|p_|)$", name):
         # Détection du côté
-        if name.endswith("p") or name.endswith("_p") or name.endswith("'"):
+        if name.endswith("p") or name.endswith("_p") or name.endswith("'") or name.endswith("p_"):
             side = "L"
             core = re.sub(r"(_?p|'$)", "", name)   # on enlève le suffixe gauche
             core = re.sub(r"_$", "", name)         # on enlève "_" final éventuel
