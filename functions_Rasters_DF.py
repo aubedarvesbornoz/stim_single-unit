@@ -455,7 +455,6 @@ def is_in_ZEZIZPZLNI(patient, elec, plots, root):
         for zone in dict_index_zone.keys() : 
             dict_zone2boolean[zone] = np.nan
         dict_zone2boolean['NI'] = np.nan
-    # print('end ZE',dict_zone2boolean)
     return list(dict_zone2boolean.values())
 
 
@@ -474,7 +473,6 @@ def RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root):
 ## 1) Charger recording + sorting depuis neuroscope
     # (read_neuroscope suppose que les .res/.clu sont dans le même dossier que le .xml)
     xml_path = f"{path_folder}/{patient}_stim{session}.xml"  
-    print(xml_path)
     recording, sorting = read_neuroscope(xml_path, load_recording=True, load_sorting=True)
 
 ## 2) charger probe geometry
@@ -985,6 +983,7 @@ def compute_neuronal_summary(spikes, stims_loca, dict_clu2tt, dict_elec2deadfile
 def create_or_update_session_summary(patient, session, root='D:/',verb=False, bin_z=0.05, bin_resp=[0.05, 0.075, 0.1]):
     ''' Cree le tableau récapitulatif pour une session: summary_by_neuron et general_summary_by_neuron_and_stim, a partir du patient et session
     Tourne pendant environ 30 sec/1 min par session. '''
+    print(f"=== Create or update session summary for {patient}, session {session}. ===")
     path_folder = root + 'Spike-sorting/Data_folders/'+patient+'/'+patient+'_stim'+session+'/'
     sr = get_SR(patient)
     spikes = get_nwb(patient, session, root)
@@ -1558,6 +1557,7 @@ def create_or_update_rasters(patient, session, overwrite_rasters=True, root='D:/
     overwrite_rasters = False si les rasters ont déjà été faits
     disp = True pour afficher les zones artéfactées
     '''
+    print(f"=== Create or update raster plots for {patient}, session {session}. ===")
     path_folder = root + 'Spike-sorting/Data_folders/'+patient+'/'+patient+'_stim'+session+'/'
     rasters_folder_artefacts = root + 'Spike-sorting/Rasters'+'/'+patient+'_stim'+session+'/'
     rasters_folder_NoArtefacts = root + 'Spike-sorting/Rasters_noPatch'+'/'+patient+'_stim'+session+'/'
@@ -1586,7 +1586,7 @@ def create_or_update_rasters(patient, session, overwrite_rasters=True, root='D:/
                 rasters_OneNeuron_allStims(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_rasters=rasters_folder, display_patches = disp_patch[ind], plafond_inhib_100 = True)
                 rasters_OneStim_allNeurons(patient, session, spikes, stims_loca, dict_clu2tt, dict_elec2deadfile, path_rasters=rasters_folder, display_patches = disp_patch[ind], plafond_inhib_100 = True)
             else:
-                print('rasters already exist and overwrite_rasters=False')
+                print('Raster plots already exist for this session, and overwrite_rasters is False')
 
 ##################################################
 # Signal display functions
