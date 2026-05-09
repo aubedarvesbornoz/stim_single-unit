@@ -476,19 +476,49 @@ def RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root):
     recording, sorting = read_neuroscope(xml_path, load_recording=True, load_sorting=True)
 
 ## 2) charger probe geometry
-    n_tetrodes = mapping_anat.shape[0]
-    # positions: chaque tetrode = carré 2x2, tétrodes espacées
-    spacing_tetrode = 500.0  # µm
-    local = np.array([[0,0],[0,20],[20,0],[20,20]], dtype=float)  # 4 contacts proches
-    positions = np.zeros((n_tetrodes * 4, 2), dtype=float)
-    for t in range(n_tetrodes):
-        base = np.array([t * spacing_tetrode, 0.0])
-        positions[t*4:(t+1)*4] = local + base
-    probe = pi.Probe(ndim=2)
-    probe.set_contacts(positions=positions, shapes="circle", shape_params={"radius": 5})
-    probe.set_device_channel_indices(np.arange(n_tetrodes * 4))
-    recording = recording.set_probe(probe, in_place=False) # on associe le mapping au recording
+    # n_tetrodes = mapping_anat.shape[0]
+    # # positions: chaque tetrode = carré 2x2, tétrodes espacées
+    # spacing_tetrode = 500.0  # µm
+    # local = np.array([[0,0],[0,20],[20,0],[20,20]], dtype=float)  # 4 contacts proches
+    # positions = np.zeros((n_tetrodes * 4, 2), dtype=float)
+    # for t in range(n_tetrodes):
+    #     base = np.array([t * spacing_tetrode, 0.0])
+    #     positions[t*4:(t+1)*4] = local + base
+    # probe = pi.Probe(ndim=2)
+    # probe.set_contacts(positions=positions, shapes="circle", shape_params={"radius": 5})
+    # probe.set_device_channel_indices(np.arange(n_tetrodes * 4))
+    # recording = recording.set_probe(probe, in_place=False) # on associe le mapping au recording
     
+    ## 2) charger probe geometry robuste aux canaux absents
+    n_tetrodes = mapping_anat.shape[0]
+    spacing_tetrode = 500.0
+    local = np.array([[0, 0], [0, 20], [20, 0], [20, 20]], dtype=float)
+
+    # Canaux réellement présents dans le recording
+    channel_ids = list(recording.get_channel_ids())        # ex: ['0', '1', ..., '52']
+    channel_ids = np.array([int(ch) for ch in channel_ids])
+
+    # Position théorique de chaque canal restant
+    positions = np.zeros((len(channel_ids), 2), dtype=float)
+
+    for i, ch in enumerate(channel_ids):
+        t = ch // 4          # tétrode 0-index
+        k = ch % 4           # canal local dans la tétrode
+        base = np.array([t * spacing_tetrode, 0.0])
+        positions[i] = local[k] + base
+
+    probe = pi.Probe(ndim=2)
+    probe.set_contacts(
+        positions=positions,
+        shapes="circle",
+        shape_params={"radius": 5})
+
+    # Ici les indices doivent correspondre aux indices internes du recording, pas forcément aux IDs originaux des canaux
+    probe.set_device_channel_indices(np.arange(len(channel_ids)))
+
+    recording = recording.set_probe(probe, in_place=False)
+
+
 ## 3) For one electrode: rec + sorting 
 
     # sous-sorting (unités dont group ∈ clus)
@@ -501,11 +531,25 @@ def RecFiltered_Sort_SI_elec(patient, session, clus, mapping_anat, root):
     sorting_elec = select_units_by_group(sorting, clus)
 
     # sous-recording : canaux de l'electrode seulement
-    ch=[]
-    for tt in clus :
-        ch.append([str(tt*4-4), str(tt*4-3), str(tt*4-2), str(tt*4-1)])
-    ch = [x for xs in ch for x in xs] # on applatit la liste de listes en liste
-    recording_elec = recording.select_channels(ch) 
+    # ch=[]
+    # for tt in clus :
+    #     ch.append([str(tt*4-4), str(tt*4-3), str(tt*4-2), str(tt*4-1)])
+    # ch = [x for xs in ch for x in xs] # on applatit la liste de listes en liste
+    # recording_elec = recording.select_channels(ch) 
+    ch = []
+    for tt in clus:
+        ch.extend([
+            str(tt * 4 - 4),
+            str(tt * 4 - 3),
+            str(tt * 4 - 2),
+            str(tt * 4 - 1)])
+    # garder uniquement les canaux réellement présents
+    available_ch = set(recording.get_channel_ids())
+    ch = [c for c in ch if c in available_ch]
+    if len(ch) == 0:
+        raise ValueError(f"Aucun canal disponible pour clus={clus}")
+    recording_elec = recording.select_channels(ch)
+
     # filtre signal (300-3000 Hz)
     recording_elec_f = bandpass_filter(recording=recording_elec, freq_min=300, freq_max=3000)
 
