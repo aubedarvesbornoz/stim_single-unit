@@ -125,7 +125,10 @@ def get_dict_deadfiles(mapping_anat, patient, session, path_folder, sr):
     dict_elec2deadfile = {} # va chercher tous les deadfiles dans le sous-dossier "derivatives" de la session
     dict_ttInd2tt = {i+1:mapping_anat.loc[i, 'tt'] for i in range(mapping_anat.shape[0])} # numero de fichier klusters vers nom de tt
     for elec in np.unique([tt[:-1] for tt in list(dict_ttInd2tt.values())]):
-        dict_elec2deadfile[elec] = merge_overlapping_events(pd.read_csv(path_folder+'derivatives/'+patient+'_stim'+session+'_deadfile_'+elec+'_in_ts.txt', header = None, sep='\t') / sr)
+        try:
+            dict_elec2deadfile[elec] = merge_overlapping_events(pd.read_csv(path_folder+'derivatives/'+patient+'_stim'+session+'_deadfile_'+elec+'_in_ts.txt', header = None, sep='\t') / sr)
+        except TypeError:
+            print(TypeError, 'deadfile',elec, pd.read_csv(path_folder+'derivatives/'+patient+'_stim'+session+'_deadfile_'+elec+'_in_ts.txt', header = None, sep='\t'))
     return dict_elec2deadfile
 
 def get_dict_tetrodeName_from_tetrodeIndex(spikes, mapping_anat):
