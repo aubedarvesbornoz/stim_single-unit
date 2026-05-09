@@ -177,6 +177,7 @@ def normalize_name(name: str) -> str:
         if name.endswith("p") or name.endswith("_p") or name.endswith("'"):
             side = "L"
             core = re.sub(r"(_?p|'$)", "", name)   # on enlève le suffixe gauche
+            core = re.sub(r"_$", "", name)         # on enlève "_" final éventuel
         else:
             side = "R"
             core = re.sub(r"_$", "", name)         # on enlève "_" final éventuel
@@ -253,6 +254,7 @@ def find_back_macrocontacts_from_tt(norm_name, coord_MNI_pat, verb=False):
     if coord_MNI_pat[coord_MNI_pat['Electrode_name']==macro_tt]['Electrode_model'].unique().tolist() == ['hybride']:
         plots_asso = '1-2'
     elif coord_MNI_pat[coord_MNI_pat['Electrode_name']==macro_tt]['Electrode_model'].unique().tolist() == ['hybride latérale']:
+        print(f"{macro_tt} = lateral tetrodes")
         if coord_MNI_pat[coord_MNI_pat['Electrode_name']==macro_tt]['Number_of_tetrodes'].unique().tolist() == [2]:
             plots_asso = '8-9'
         elif coord_MNI_pat[coord_MNI_pat['Electrode_name']==macro_tt]['Number_of_tetrodes'].unique().tolist() == [3]:
@@ -1040,8 +1042,8 @@ def update_general_summary_on_all_sessions(root='D:/'):
         all_summaries_nrn.append(df_summary_nrn)
 
     # Empile tous les dataframes de type summary
-    big_df_trials = pd.concat(all_summaries_trials, ignore_index=True)
-    big_df_by_nrn = pd.concat(all_summaries_nrn, ignore_index=True)
+    big_df_trials = pd.concat(all_summaries_trials, axis=1, ignore_index=True)
+    big_df_by_nrn = pd.concat(all_summaries_nrn, axis=1, ignore_index=True)
 
     # Export des dataframes generaux
     big_df_trials.to_excel(root+"Spike-sorting/Tables/general_summary_all_sessions.xlsx", index=False)
