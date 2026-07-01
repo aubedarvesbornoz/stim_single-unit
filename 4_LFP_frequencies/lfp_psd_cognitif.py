@@ -55,6 +55,7 @@ from lfp_preprocess import (
     get_bad_channels_for_session,
     load_trc_as_mne_raw,
     apply_filters,
+    parse_bipolar_shaft,
     build_adjacent_bipolar_pairs,
     make_bipolar_data,
     recover_precise_macro_stim_events,
@@ -223,11 +224,77 @@ def psd_to_long_table(
                 "bp_channel": ch,
                 "freq_hz": freqs,
                 "psd_v2_hz": psd_arr[ti, ci, :],
+                "stim_shaft": str(trial.get("stim_shaft", "")),
+                "stim_bipolar_label": str(trial.get("stim_bipolar_label", "")),
+                "stim_contact_pair": str(trial.get("stim_contact_pair", ""))
             }))
 
     if not rows:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
+
+
+
+def classify_local_distant_for_bp_channel(row: pd.Series) -> str:
+    """
+    Classe un canal bipolaire comme local ou distant relativement à l'électrode stimulée.
+
+    Local = même shaft/électrode que la stimulation.
+    Distant = autre shaft.
+    """
+    stim_shaft = str(row.get("stim_shaft", "")).strip()
+    bp_channel = str(row.get("bp_channel", "")).strip()
+
+    if not stim_shaft or stim_shaft.lower() == "none":
+        return "unknown"
+
+    bp_shaft = parse_bipolar_shaft(bp_channel)
+
+    if bp_shaft == stim_shaft:
+        return "local"
+
+    return "distant"
+
+
+
+def add_local_distant_labels(psd_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ajoute une colonne local_distant à la table PSD longue.
+    """
+    out = psd_long.copy()
+    out["local_distant"] = out.apply(classify_local_distant_for_bp_channel, axis=1)
+    return out
+
+
+def build_cog_local_distant_psd_long(psd_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construit une table PSD longue restreinte aux stimulations avec effet cognitif,
+    avec les conditions :
+        - pre-EBS
+        - post-EBS_cog_local
+        - post-EBS_cog_distant
+    """
+    df = add_local_distant_labels(psd_long)
+
+    # On garde uniquement les stimulations cognitives.
+    df = df.loc[df["group_label"].eq("cog+")].copy()
+
+    if len(df) == 0:
+        return pd.DataFrame()
+
+    # Baseline pré-EBS : toutes les baselines des stimulations cog+,
+    # sans distinction local/distant.
+    pre = df.loc[df["condition"].eq("pre-EBS")].copy()
+    pre["condition"] = "pre-EBS"
+
+    # Post-EBS local/distant.
+    post = df.loc[df["condition"].eq("post-EBS_cog")].copy()
+    post = post.loc[post["local_distant"].isin(["local", "distant"])].copy()
+    post["condition"] = "post-EBS_cog_" + post["local_distant"]
+
+    out = pd.concat([pre, post], ignore_index=True)
+
+    return out
 
 
 # =============================================================================
@@ -246,6 +313,62 @@ def _select_trials_for_psd(trials: pd.DataFrame, cfg: PSDConfig) -> pd.DataFrame
 
     out = trials.loc[trials["group_label"].isin(groups)].copy()
     return out.reset_index(drop=True)
+
+
+def compute_stimulation_average_psd(psd_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    Moyenne PSD par stimulation incluse.
+
+    Unité :
+        session × stim_index × condition × freq
+
+    La moyenne est faite sur les canaux.
+    Pour post-EBS local/distant, la moyenne est faite séparément
+    sur les canaux local ou distant.
+    """
+    if len(psd_long) == 0:
+        return pd.DataFrame()
+
+    stim_avg = (
+        psd_long
+        .groupby(
+            [
+                "session",
+                "stim_index",
+                "label_stim",
+                "condition",
+                "freq_hz",
+            ],
+            as_index=False,
+        )["psd_v2_hz"]
+        .agg(
+            mean_psd_v2_hz="mean",
+            sd_psd_v2_hz="std",
+            n_units="count",
+        )
+    )
+
+    stim_avg["sem_psd_v2_hz"] = (
+        stim_avg["sd_psd_v2_hz"] / np.sqrt(stim_avg["n_units"].clip(lower=1))
+    )
+
+    return stim_avg
+
+
+def export_stimulation_average_psd(
+    psd_long: pd.DataFrame,
+    cfg: PSDConfig,
+    name: str = "cog_local_distant",
+) -> pd.DataFrame:
+    stim_avg = compute_stimulation_average_psd(psd_long)
+
+    out_dir = Path(cfg.output_dir) / "stimulation_averages"
+    ensure_dir(out_dir)
+
+    out_csv = out_dir / f"{name}_stimulation_average_psd.csv"
+    stim_avg.to_csv(out_csv, index=False)
+
+    return stim_avg
 
 
 def compute_session_psd(session: str, cfg: PSDConfig) -> pd.DataFrame:
@@ -505,6 +628,49 @@ def compute_grand_average(
     return grand
 
 
+def export_cog_local_distant_session_averages(
+    psd_long: pd.DataFrame,
+    cfg: PSDConfig,
+    average_first: str = "trial_channel",
+) -> pd.DataFrame:
+    '''
+    Export PSD cog-distance par session
+    '''
+    out_dir = Path(cfg.output_dir) / "session_averages"
+    ensure_dir(out_dir)
+
+    session_tables = []
+
+    for session, sub in psd_long.groupby("session", sort=False):
+        session_avg = compute_grand_average(sub, average_first=average_first)
+        session_avg.insert(0, "session", session)
+
+        out_csv = out_dir / f"{safe_name(session)}_cog_local_distant_average_psd.csv"
+        session_avg.to_csv(out_csv, index=False)
+
+        session_tables.append(session_avg)
+
+    if not session_tables:
+        return pd.DataFrame()
+
+    return pd.concat(session_tables, ignore_index=True)
+
+
+def export_cog_local_distant_grand_average(
+    psd_long: pd.DataFrame,
+    cfg: PSDConfig,
+    average_first: str = "trial_channel",
+) -> pd.DataFrame:
+    '''
+    Export PSD cog-distance en global
+    '''
+    grand = compute_grand_average(psd_long, average_first=average_first)
+
+    out_csv = Path(cfg.output_dir) / "grand_average_psd_cog_local_distant.csv"
+    grand.to_csv(out_csv, index=False)
+
+    return grand
+
 # =============================================================================
 # PLOTS
 # =============================================================================
@@ -570,9 +736,198 @@ def plot_grand_average_psd(
     return fig
 
 
+def plot_cog_local_distant_psd_by_stimulation(
+    stim_avg: pd.DataFrame,
+    cfg: PSDConfig,
+    yscale: str = "log",
+    show_sem: bool = True,
+) -> None:
+    """
+    Exporte une figure PSD cog local/distant par stimulation.
+
+    Nom fichier :
+        session_stim-XXX_label-stim-label_psd_cog_local_distant.png
+    """
+    out_dir = Path(cfg.output_dir) / "stimulation_figures"
+    ensure_dir(out_dir)
+
+    styles = {
+        "pre-EBS": {"label": "pre-EBS", "color": "gray"},
+        "post-EBS_cog_local": {"label": "post-EBS cog local", "color": "green"},
+        "post-EBS_cog_distant": {"label": "post-EBS cog distant", "color": "orange"},
+    }
+
+    group_cols = ["session", "stim_index", "label_stim"]
+
+    for (session, stim_index, label_stim), sub_stim in stim_avg.groupby(group_cols, sort=False):
+        fig, ax = plt.subplots(figsize=(5, 8))
+
+        for cond, style in styles.items():
+            sub = sub_stim.loc[sub_stim["condition"].eq(cond)].sort_values("freq_hz")
+            if len(sub) == 0:
+                continue
+
+            x = sub["freq_hz"].to_numpy()
+            y = sub["mean_psd_v2_hz"].to_numpy()
+            n = int(sub["n_units"].iloc[0])
+
+            ax.plot(
+                x,
+                y,
+                label=f"{style['label']} (n={n})",
+                color=style["color"],
+            )
+
+            if show_sem and "sem_psd_v2_hz" in sub.columns:
+                sem = sub["sem_psd_v2_hz"].to_numpy()
+                ax.fill_between(
+                    x,
+                    y - sem,
+                    y + sem,
+                    alpha=0.2,
+                    color=style["color"],
+                )
+
+        ax.tick_params(axis='both', labelsize='xx-large')
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("PSD (V²/Hz)")
+        # ax.set_title(f"{session} | stim {stim_index} | {label_stim}")
+        ax.set_xlim(cfg.fmin, cfg.fmax)
+        ax.set_yscale(yscale)
+        # ax.legend(frameon=False)
+        ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+
+        fname = (
+            f"{safe_name(session)}"
+            f"_stim-{int(stim_index):03d}"
+            f"_label-{safe_name(label_stim)}"
+            f"_psd_cog_local_distant.png"
+        )
+
+        fig.savefig(out_dir / fname, dpi=300)
+        plt.close(fig)
+
+
+
+def plot_cog_local_distant_psd(
+    avg_df: pd.DataFrame,
+    cfg: PSDConfig,
+    title: str = "PSD cog local/distant",
+    save_name: str = "psd_cog_local_distant.png",
+    yscale: str = "log",
+    show_sem: bool = True,
+) -> plt.Figure:
+
+    fig, ax = plt.subplots(figsize=(5, 8))
+
+    styles = {
+        "pre-EBS": {"label": "pre-EBS", "color": "gray"},
+        "post-EBS_cog_local": {"label": "post-EBS cog local", "color": "green"},
+        "post-EBS_cog_distant": {"label": "post-EBS cog distant", "color": "orange"},
+    }
+
+    for cond, style in styles.items():
+        sub = avg_df.loc[avg_df["condition"].eq(cond)].sort_values("freq_hz")
+        if len(sub) == 0:
+            continue
+
+        x = sub["freq_hz"].to_numpy()
+        y = sub["mean_psd_v2_hz"].to_numpy()
+        n = int(sub["n_units"].iloc[0])
+
+        ax.plot(x, y, label=f"{style['label']} (n={n})", color=style["color"])
+
+        if show_sem and "sem_psd_v2_hz" in sub.columns:
+            sem = sub["sem_psd_v2_hz"].to_numpy()
+            ax.fill_between(x, y - sem, y + sem, alpha=0.2, color=style["color"])
+
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("PSD (V²/Hz)")
+    ax.set_title(title)
+    ax.set_xlim(cfg.fmin, cfg.fmax)
+    ax.set_yscale(yscale)
+    ax.legend(frameon=False)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+
+    if cfg.save_figures:
+        out_dir = Path(cfg.output_dir) / "figures"
+        ensure_dir(out_dir)
+        fig.savefig(out_dir / save_name, dpi=300)
+
+    return fig
+
+
 # =============================================================================
 # FULL PIPELINE
 # =============================================================================
+
+
+def run_cog_local_distant_psd_exports(
+    all_psd: pd.DataFrame,
+    cfg: PSDConfig,
+    average_first: str = "trial_channel",
+) -> Dict[str, pd.DataFrame]:
+    """
+    Crée les exports PSD cog local/distant à partir de la table PSD longue complète.
+    """
+    cog_ld = build_cog_local_distant_psd_long(all_psd)
+
+    if len(cog_ld) == 0:
+        log("[WARN] aucune donnée cog local/distant à exporter", cfg.verbose)
+        return {}
+
+    out_dir = Path(cfg.output_dir)
+    ensure_dir(out_dir)
+
+    # Table longue filtrée.
+    cog_ld.to_parquet(
+        out_dir / "all_sessions_psd_cog_local_distant_long.parquet",
+        index=False,
+    )
+
+    # Par stimulation.
+    stim_avg = export_stimulation_average_psd(
+        cog_ld,
+        cfg,
+        name="cog_local_distant",
+    )
+    if cfg.save_figures:
+        plot_cog_local_distant_psd_by_stimulation(
+            stim_avg,
+            cfg,
+        )
+
+    # Par session.
+    session_avg = export_cog_local_distant_session_averages(
+        cog_ld,
+        cfg,
+        average_first=average_first,
+    )
+
+    # Global.
+    grand = export_cog_local_distant_grand_average(
+        cog_ld,
+        cfg,
+        average_first=average_first,
+    )
+
+    # Figure globale.
+    plot_cog_local_distant_psd(
+        grand,
+        cfg,
+        title="Grand-average PSD cog local/distant",
+        save_name="grand_average_psd_cog_local_distant.png",
+    )
+
+    return {
+        "long": cog_ld,
+        "stimulation_average": stim_avg,
+        "session_average": session_avg,
+        "grand_average": grand,
+    }
+
 
 def run_psd_pipeline(
     cfg: PSDConfig,
@@ -589,14 +944,14 @@ def run_psd_pipeline(
     grand : pd.DataFrame
         Grand average par condition × fréquence.
     """
-
+    print('in run')
     cfg.root_dir = Path(cfg.root_dir)
     cfg.output_dir = Path(cfg.output_dir)
     ensure_dir(cfg.output_dir)
 
     if sessions is None:
         sessions = list_trc_sessions(cfg.root_dir)
-
+    print(sessions)
     all_tables = []
     for session in sessions:
         try:
@@ -611,14 +966,16 @@ def run_psd_pipeline(
 
     if not all_tables:
         return pd.DataFrame(), pd.DataFrame()
-
+    print(all_tables)
     all_psd = pd.concat(all_tables, ignore_index=True)
     grand = compute_grand_average(all_psd, average_first=average_first)
+    cog_local_distant_outputs = run_cog_local_distant_psd_exports(all_psd, cfg, average_first=average_first)
 
     if cfg.save_tables:
         all_psd.to_parquet(cfg.output_dir / f"all_sessions_psd_long__pre={float(cfg.pre_length)}s_post={float(cfg.post_length)}s.parquet", index=False)
         grand.to_csv(cfg.output_dir / f"grand_average_psd__pre={float(cfg.pre_length)}s_post={float(cfg.post_length)}s.csv", index=False)
-    return all_psd, grand
+    
+    return all_psd, grand, cog_local_distant_outputs
 
 
 __all__ = [
@@ -630,4 +987,14 @@ __all__ = [
     "compute_grand_average",
     "plot_grand_average_psd",
     "run_psd_pipeline",
+    "classify_local_distant_for_bp_channel",
+    "add_local_distant_labels",
+    "build_cog_local_distant_psd_long",
+    "compute_stimulation_average_psd",
+    "export_stimulation_average_psd",
+    "export_cog_local_distant_session_averages",
+    "export_cog_local_distant_grand_average",
+    "plot_cog_local_distant_psd",
+    "plot_cog_local_distant_psd_by_stimulation",
+    "run_cog_local_distant_psd_exports",
 ]
