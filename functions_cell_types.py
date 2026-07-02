@@ -1,3 +1,123 @@
+# -*- coding: utf-8 -*-
+"""
+functions_cell_types.py
+=======================
+
+Utility functions for putative cell-type labelling of human SEEG single-units.
+
+This module centralizes all functions related to:
+    1. waveform/template extraction from heavy NeuroScope/Klusters sessions;
+    2. waveform feature computation;
+    3. waveform standardization and caching for WaveMAP-like analyses;
+    4. putative FS/RS cell-type classification using waveform metrics (based from Peyrache et al, 2012);
+    5. optional WaveMAP clustering from cached waveforms;
+    6. merging cell-type labels back into neuronal summary tables.
+
+The intended workflow is split into two stages.
+
+Stage 1: heavy extraction, performed only on the disk containing .dat files
+--------------------------------------------------------------------------
+
+For each session, the pipeline loads the NeuroScope/Klusters recording and
+sorting, optionally removes dead periods, computes average templates, extracts
+waveform metrics, and saves a permanent lightweight cache.
+
+The cache contains:
+    - scalar waveform and quality features, one row per unit;
+    - standardized average waveforms for WaveMAP;
+    - normalized waveforms for UMAP / graph clustering;
+    - stable unit identifiers of the form:
+          patient|stimic<session>|clu<clu_id>
+
+This stage requires access to the original heavy data files, especially .dat.
+
+Typical functions:
+    - get_celltype_cache_paths
+    - get_source_polarity_multiplier
+    - standardize_waveform_for_wavemap
+    - celltype_features_session
+    - extract_celltype_cache_session_if_needed
+    - build_celltype_global_cache
+    - diagnose_celltype_waveform_cache
+    - delete_celltype_cache_session
+
+Stage 2: lightweight analysis, performed from cached tables/waveforms
+--------------------------------------------------------------------
+
+Once the cache exists, cell-type labelling can be rerun without reopening .dat
+files. The global cache is used to fit a two-component GMM on waveform features,
+usually trough-to-peak duration and peak half-width. The cluster with the shorter
+trough-to-peak duration is labelled putative fast-spiking inhibitory, whereas
+the broader cluster is labelled putative regular-spiking excitatory.
+
+Typical functions:
+    - classify_celltypes_gmm_global
+    - run_and_save_celltype_gmm_global
+    - run_wavemap_from_cache
+    - plot_peyrache_scatter
+    - plot_peyrache_waveforms_by_class
+    - plot_waveform_metric_matrix
+    - run_celltype_qc_plots
+
+Merging with neuronal summaries
+-------------------------------
+
+Cell-type labels should be merged back into:
+    - summary_by_nrn_all_sessions
+    - general_summary_all_sessions
+
+The merge key is:
+    patient, session, clu
+
+Session labels are normalized internally so that '3', 'stim3', and 'stimic3'
+are treated as the same session.
+
+Typical functions:
+    - merge_celltypes_into_neuronal_df
+    - merge_global_neuronal_summaries_with_celltypes
+
+Recommended file formats
+------------------------
+
+Parquet is the recommended format for all pipeline operations. XLSX export is
+optional and used only for manual inspection.
+
+Recommended:
+    .parquet  -> source of truth / pipeline input-output
+    .xlsx     -> optional human-readable export
+    .npz      -> waveform arrays
+    .png      -> quality-control figures
+
+Important conventions
+---------------------
+
+1. Cell-type labels are putative.
+   They should not be interpreted as definitive excitatory/inhibitory identities.
+
+2. Waveform polarity is acquisition-dependent.
+   Blackrock recordings are assumed to have correct polarity.
+   Neuralynx recordings are assumed to be inverted unless explicitly listed as
+   exceptions, e.g. P106_LL59 sessions 1, 3, and 5.
+
+3. Sampling frequency varies across patients.
+   Therefore all temporal waveform features must be stored in milliseconds,
+   and waveforms used for WaveMAP must be resampled onto a common time grid.
+
+4. Cached waveforms must not contain NaN or inf.
+   Invalid waveforms are stored as zeros and marked with waveform_cache_ok=False.
+
+5. The heavy extraction stage should be rerun only when:
+   - the source sorting changes;
+   - the waveform extraction code changes;
+   - the polarity rules change;
+   - the target WaveMAP time grid changes;
+   - the SpikeInterface preprocessing parameters change.
+
+Author
+------
+Aube Darves-Bornoz
+"""
+
 import pandas as pd
 import numpy as np
 import spikeinterface as si
@@ -1160,7 +1280,6 @@ def build_celltype_global_cache(root):
 ##################################################
 # Cell-type labelling
 ##################################################
-
 
 def classify_celltypes_gmm_global(
     features_all,
