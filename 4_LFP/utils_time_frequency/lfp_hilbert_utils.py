@@ -54,7 +54,7 @@ import pandas as pd
 from scipy import signal
 import os
 
-from lfp_preprocess import (
+from lfp_preprocess_utils import (
     log,
     ensure_dir,
     safe_name,

@@ -46,7 +46,7 @@ from scipy import signal
 import matplotlib.pyplot as plt
 
 # Adapte l'import si ton fichier s'appelle autrement ou est dans un sous-dossier.
-from lfp_preprocess import (
+from utils_time_frequency.lfp_preprocess_utils import (
     log,
     ensure_dir,
     safe_name,

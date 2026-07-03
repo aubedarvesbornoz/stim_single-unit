@@ -41,7 +41,7 @@ import pandas as pd
 from mne.stats import combine_adjacency, permutation_cluster_1samp_test
 from scipy.stats import t, wilcoxon
 
-from lfp_preprocess import (
+from lfp_preprocess_utils import (
     log,
     ensure_dir,
     safe_name,

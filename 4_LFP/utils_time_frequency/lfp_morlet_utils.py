@@ -40,7 +40,7 @@ import mne
 import numpy as np
 import pandas as pd
 
-from lfp_preprocess import (
+from lfp_preprocess_utils import (
     log,
     ensure_dir,
     safe_name,

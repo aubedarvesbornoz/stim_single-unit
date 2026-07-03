@@ -561,32 +561,24 @@ def read_stim_events(path: str | Path) -> pd.DataFrame:
     Compatible séparateurs tab, virgule, point-virgule ou espaces.
     """
     path = Path(path)
-    # print('in read stim') # ok 
-    df = pd.read_csv(path, sep=None, engine="python", header=None)
-    # print(df) # ok
-    # expected = ["label_stim", "t_start", "duration"]
-    # print(df.shape) # ok
-    # if list(df.columns[:3]) != expected:
-    #     print('in if')
+    df = pd.read_csv(path, sep=None, engine="python")
+    expected = ["label_stim", "t_start", "duration"]
+    if list(df.columns[:3]) != expected:
         # fallback si fichier sans header, car parfois noms colonnes présents, parfois absents, 
         # selon type de fichier = 3 colonnes sans nom (events TRC bruts), ou plus de colonnes, mais labellisées.
-
-        # df = pd.read_csv(
-        #     path,
-        #     sep=None,
-        #     engine="python",
-        #     header=None,
-        #     names=expected,
-        # )
-        # df.columns[:3] = expected
+        df = pd.read_csv(
+            path,
+            sep=None,
+            engine="python",
+            header=None,
+            names=expected,
+        )
+        df.columns[:3] = expected
     df = df.iloc[:,:3]
-    # print(df.shape)
     df.columns = ["label_stim", "t_start", "duration"]
-    # print(df.shape)
     df["label_stim"] = df["label_stim"].astype(str)
     df["t_start"] = pd.to_numeric(df["t_start"])
     df["duration"] = pd.to_numeric(df["duration"])
-    # print(df) 
     return df
 
 
@@ -759,30 +751,6 @@ def find_cog_file(root_dir: Path, session: str) -> Path:
     return matches[0]
 
 
-
-# def find_duration_file(root_dir: Path, session: str) -> Path:
-#     """
-#     Recherche le fichier de durée/temps de stimulation d'une session.
-
-#     Paramètres
-#     ----------
-#     root_dir : Path
-#         Dossier racine de la session.
-#     session : str
-#         Nom de session.
-
-#     Retour
-#     ------
-#     Path
-#         Chemin vers le fichier duration correspondant.
-#     """
-#     fp = root_dir / f"{session}_stim_events_TRC_duration.txt"
-#     if not fp.exists():
-#         raise FileNotFoundError(f"Fichier duration introuvable: {fp}")
-#     return fp
-
-
-
 def read_cog_file(cog_file: Path) -> pd.DataFrame:
     """
     Lit le fichier des annotations cognitives d'une session.
@@ -815,38 +783,6 @@ def read_cog_file(cog_file: Path) -> pd.DataFrame:
 
     df = df.rename(columns={"stim": "label_stim"})
     return df
-
-
-
-# def read_duration_file(duration_file: Path) -> pd.DataFrame:
-#     """
-#     Lit le fichier contenant les bons temps de début et durées des stimulations.
-
-#     Format attendu
-#     --------------
-#     Fichier sans noms de colonnes, contenant a minima :
-#     label_stim, t_start, duration
-
-#     Paramètres
-#     ----------
-#     duration_file : Path
-#         Chemin vers le fichier de durée.
-
-#     Retour
-#     ------
-#     pd.DataFrame
-#         Table normalisée avec colonnes ['label_stim', 't_start', 'duration'].
-#     """
-#     df = pd.read_csv(duration_file, sep=",", engine="python", header=None)
-#     if df.shape[1] < 3:
-#         raise ValueError(f"Le fichier {duration_file.name} doit avoir au moins 3 colonnes")
-
-#     df = df.iloc[:, :3].copy()
-#     df.columns = ["label_stim", "t_start", "duration"]
-#     df["label_stim"] = df["label_stim"].astype(str).str.strip()
-#     df["t_start"] = pd.to_numeric(df["t_start"], errors="coerce")
-#     df["duration"] = pd.to_numeric(df["duration"], errors="coerce")
-#     return df
 
 
 

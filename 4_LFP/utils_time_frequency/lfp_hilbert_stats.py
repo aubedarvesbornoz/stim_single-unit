@@ -37,7 +37,7 @@ from scipy.stats import t, wilcoxon
 # import mne
 from mne.stats import permutation_cluster_1samp_test
 
-from lfp_preprocess import (
+from lfp_preprocess_utils import (
     log,
     ensure_dir,
     safe_name,
