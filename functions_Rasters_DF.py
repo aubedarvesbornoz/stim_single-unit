@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec # affichage rasters
 import pynapple as nap
 from pynapple.io import interface_nwb
-from pynapple.io.interface_nwb import NWBFile
 from pathlib import Path
 import ast
 import seaborn as sb
@@ -55,7 +54,6 @@ def get_nwb(patient, session, root='D:/'):
     if not os.path.exists(nwbfile_path): # creation du nwb s'il n'existe pas encore
         from datetime import datetime
         from dateutil import tz
-        from neuroconv.datainterfaces import NeuroScopeRecordingInterface
         from neuroconv.datainterfaces import NeuroScopeSortingInterface
         xml_path = Path(path_folder + files_basename + ".xml")
         interface = NeuroScopeSortingInterface(folder_path = Path(path_folder), xml_file_path=xml_path, verbose=False)
@@ -64,6 +62,7 @@ def get_nwb(patient, session, root='D:/'):
         metadata["NWBFile"].update(session_start_time=session_start_time)
         interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata)
 
+    from pynapple.io.interface_nwb import NWBFile
     spikes = NWBFile(nwbfile_path)["units"]
     
     return spikes

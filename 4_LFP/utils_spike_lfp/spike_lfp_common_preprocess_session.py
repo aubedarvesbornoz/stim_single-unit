@@ -77,6 +77,7 @@ from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Seque
 
 import numpy as np
 import pandas as pd
+import os
 
 
 # =============================================================================
@@ -211,6 +212,32 @@ def _to_float_or_nan(x: Any) -> float:
         return float(s)
     except Exception:
         return np.nan
+
+
+def get_nwb(patient, session, root='D:/'):
+    '''
+    Renvoie le nwb associe a la session
+    root = 'D:/' ou 'C:/Users/darves-bornoz/Documents/'
+    '''
+    path_folder = root + 'Spike-sorting/Data_folders/'+patient+'/'+patient+'_stim'+session+'/'
+    files_basename = patient+'_stim'+session
+    nwbfile_path = path_folder + files_basename + ".nwb"
+    print(path_folder, '.nwb existe deja ?', os.path.exists(nwbfile_path))
+    if not os.path.exists(nwbfile_path): # creation du nwb s'il n'existe pas encore
+        from datetime import datetime
+        from dateutil import tz
+        from neuroconv.datainterfaces import NeuroScopeSortingInterface
+        xml_path = Path(path_folder + files_basename + ".xml")
+        interface = NeuroScopeSortingInterface(folder_path = Path(path_folder), xml_file_path=xml_path, verbose=False)
+        metadata = interface.get_metadata()
+        session_start_time = datetime(2023, 4, 4, 12, 30, 0, tzinfo=tz.gettz("US/Pacific"))
+        metadata["NWBFile"].update(session_start_time=session_start_time)
+        interface.run_conversion(nwbfile_path=nwbfile_path, metadata=metadata)
+
+    from pynapple.io.interface_nwb import NWBFile
+    spikes = NWBFile(nwbfile_path)["units"]
+    
+    return spikes
 
 
 # =============================================================================

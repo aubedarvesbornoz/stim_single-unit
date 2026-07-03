@@ -26,7 +26,7 @@ Pour chaque largeur de bin demandée, typiquement 100 ou 500 ms :
     1. on construit des bins temporels pré et post ;
     2. on calcule le firing rate du neurone dans le bin micro correspondant ;
     3. on normalise ce firing rate par la baseline pré-stim du même trial ;
-    4. on moyenne la puissance/enveloppe Hilbert du même band/channel/trial/bin ;                     [LFP brut ?? quid du normalisé ? z-score ? log-ratio ?]
+    4. on moyenne la puissance/enveloppe Hilbert du même band/channel/trial/bin ;
     5. on corrèle FR normalisé et power LFP across trials.
 
 Sorties
@@ -34,40 +34,43 @@ Sorties
     - table longue optionnelle : unit × trial × channel × band × bin ;
     - table résumé : corrélations Pearson/Spearman par unit × channel × band × time bin.
 
-Remarques
----------
+Remarques méthodologiques
+-------------------------
 - Les spikes restent en référentiel micro ; le LFP/Hilbert reste en référentiel macro.
   Les deux sont associés par l'index de trial et le temps relatif pré/post.
 - La largeur de bin 100/500 ms correspond ici à un lissage rectangulaire :
-  FR = nombre de spikes dans le bin / durée du bin.                                          [quid du deadfile ?]
+  FR = nombre de spikes dans le bin / durée du bin.
 - Pour une analyse plus strictement "post-stim", laisser windows_to_correlate=('post',).
 - Le LFP Hilbert étant déjà normalisé dans ton pipeline, la colonne par défaut
   utilisée pour la corrélation est lfp_power_bin_mean. Des colonnes LFP normalisées
   par le pré-trial sont quand même produites.
 
-Auteure : Aube Darves-Bornoz
+Auteure du projet : Aube Darves-Bornoz
+Module généré pour les analyses spike–power SEIC.
 """
 
 from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass
+import re
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.stats import pearsonr, spearmanr
 
-from spike_lfp_common_preprocess import (
-        CommonSessionBundle,
-        as_spike_times_array,
-        get_spikes_in_interval,
-        parse_bipolar_shaft,
-        channel_locality_for_trial,
-        safe_name,
-    )
+from utils_spike_lfp.spike_lfp_common_preprocess import (
+    CommonSessionBundle,
+    as_spike_times_array,
+    get_spikes_in_interval,
+    parse_bipolar_shaft,
+    channel_locality_for_trial,
+    safe_name,
+)
 
 # =============================================================================
 # CONFIGURATION
@@ -83,7 +86,7 @@ LFPValueColumn = Literal[
 ]
 CorrelationMethod = Literal["spearman", "pearson"]
 WindowName = Literal["pre", "post"]
-GroupingName = Literal["all", "group_label", "locality", "group_label_x_locality"]
+GroupingName = Literal["all", "group_label", "locality", "group_label_x_locality", "cog_subcategory", "cog_subcategory_x_locality"]
 SmoothingMethod = Literal["boxcar_bin", "gaussian_bins", "none"]
 
 
@@ -105,7 +108,13 @@ class FRPowerCorrelationConfig:
 
     # LFP utilisé dans la corrélation. Par défaut : valeur Hilbert exportée/binée.
     # Les colonnes LFP normalisées par baseline pré-trial sont aussi calculées.
-    lfp_value_col: LFPValueColumn = "lfp_power_bin_mean"
+    lfp_value_col: LFPValueColumn = "lfp_power_bin_mean" 
+            # Valeurs dispo : 
+            # "lfp_power_bin_mean"        # niveau moyen brut/normalisé session selon ton Hilbert
+            # "lfp_power_pre_subtract"    # LFP_bin - LFP_pre
+            # "lfp_power_pre_percent"     # % relatif au pré
+            # "lfp_power_pre_logratio"    # log((LFP_bin + eps)/(LFP_pre + eps))
+            # "lfp_power_pre_zscore"      # z-score vs pré-trial
     epsilon_lfp: float = 1e-12
 
     # Méthodes de corrélation et seuils minimaux.
@@ -120,6 +129,8 @@ class FRPowerCorrelationConfig:
         "group_label",
         "locality",
         "group_label_x_locality",
+        "cog_subcategory",
+        "cog_subcategory_x_locality",
     )
 
     # Sélection des canaux LFP selon localité par rapport au shaft stimulé.
@@ -143,6 +154,18 @@ class FRPowerCorrelationConfig:
     save_fr_table: bool = True
     save_lfp_table: bool = False
     compression: Optional[str] = None  # ex. "gzip" pour csv.gz si souhaité
+
+    # Export d'un sous-ensemble significatif plus léger.
+    save_significant_correlations: bool = True
+    significance_p_col: str = "p_value"      # "p_value" ou "q_value_fdr_bh"
+    significance_alpha: float = 0.05
+
+    # Figures de répartition des rho/r significatifs.
+    make_significant_histograms: bool = True
+    histogram_method: str = "spearman"       # souvent plus lisible que spearman+pearson mélangés
+    histogram_significance_col: str = "p_value"
+    histogram_alpha: float = 0.05
+    histogram_bins: int = 30
 
     # Divers.
     verbose: bool = True
@@ -722,6 +745,62 @@ def _corr_one(x: np.ndarray, y: np.ndarray, method: CorrelationMethod) -> Tuple[
 
 
 
+def _parse_cog_labels_cell(value: Any) -> List[str]:
+    """Parse une cellule cog_labels robuste, compatible liste Python sérialisée ou chaîne."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip() and str(x).strip().lower() != "nan"]
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
+    s = str(value).strip()
+    if not s or s.lower() == "nan" or s == "[]":
+        return []
+    # Essai de parsing Python littéral.
+    try:
+        import ast
+        obj = ast.literal_eval(s)
+        if isinstance(obj, (list, tuple, set)):
+            return [str(x).strip() for x in obj if str(x).strip()]
+        return [str(obj).strip()] if str(obj).strip() else []
+    except Exception:
+        pass
+    parts = re.split(r"[;,/]", s)
+    return [p.strip().strip("'\"") for p in parts if p.strip()]
+
+
+def _expand_cog_subcategory_rows(df: pd.DataFrame, with_locality: bool) -> pd.DataFrame:
+    """Duplique les lignes cog+ pour chaque sous-label cognitif."""
+    if "cog_labels" not in df.columns or "group_label" not in df.columns:
+        return df.iloc[0:0].copy()
+    rows = []
+    for _, row in df.iterrows():
+        if str(row.get("group_label", "")).strip() != "cog+":
+            continue
+        labels = _parse_cog_labels_cell(row.get("cog_labels"))
+        for lab in labels:
+            if not lab:
+                continue
+            r = row.copy()
+            r["corr_grouping"] = "cog_subcategory_x_locality" if with_locality else "cog_subcategory"
+            if with_locality:
+                r["corr_condition"] = f"cog::{lab}::{row.get('locality', 'unknown')}"
+            else:
+                r["corr_condition"] = f"cog::{lab}"
+            r["cog_subcategory"] = lab
+            rows.append(r)
+    if len(rows) == 0:
+        out = df.iloc[0:0].copy()
+        out["corr_grouping"] = []
+        out["corr_condition"] = []
+        out["cog_subcategory"] = []
+        return out
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
 def _add_condition_columns_for_grouping(df: pd.DataFrame, grouping: GroupingName) -> pd.DataFrame:
     out = df.copy()
     if grouping == "all":
@@ -736,6 +815,10 @@ def _add_condition_columns_for_grouping(df: pd.DataFrame, grouping: GroupingName
     elif grouping == "group_label_x_locality":
         out["corr_grouping"] = "group_label_x_locality"
         out["corr_condition"] = out["group_label"].astype(str) + "::" + out["locality"].astype(str)
+    elif grouping == "cog_subcategory":
+        out = _expand_cog_subcategory_rows(out, with_locality=False)
+    elif grouping == "cog_subcategory_x_locality":
+        out = _expand_cog_subcategory_rows(out, with_locality=True)
     else:
         raise ValueError(f"grouping inconnu: {grouping}")
     return out
@@ -980,6 +1063,29 @@ def run_session_fr_power_correlations(bundle: CommonSessionBundle,
         cfg.compression,
     )
     saved_files["correlations"] = str(fp_corr)
+
+    if cfg.save_significant_correlations and not corr_all.empty and cfg.significance_p_col in corr_all.columns:
+        sig = get_significant_correlations(corr_all, p_col=cfg.significance_p_col, alpha=cfg.significance_alpha)
+        fp_sig = _to_csv(
+            sig,
+            session_out,
+            f"{bundle.session_name}_fr_power_correlation_signif",
+            cfg.compression,
+        )
+        saved_files["significant_correlations"] = str(fp_sig)
+    else:
+        sig = pd.DataFrame()
+
+    if cfg.make_significant_histograms and not corr_all.empty:
+        fig_dir = ensure_dir(session_out / "figures_significant_histograms")
+        fig_files = plot_significant_histograms_suite(
+            corr_df=corr_all,
+            out_dir=fig_dir,
+            prefix=bundle.session_name,
+            cfg=cfg,
+        )
+        saved_files["significant_histograms"] = [str(x) for x in fig_files]
+
     saved_files["trial_bin_tables"] = trial_bin_files
     saved_files["lfp_tables"] = lfp_files
 
@@ -990,6 +1096,7 @@ def run_session_fr_power_correlations(bundle: CommonSessionBundle,
         "bands_tested": bands,
         "bin_width_ms_options": list(cfg.bin_width_ms_options),
         "n_correlation_rows": int(len(corr_all)),
+        "n_significant_rows": int(len(sig)) if 'sig' in locals() else 0,
         "saved_files": saved_files,
     }
     with open(session_out / f"{bundle.session_name}_fr_power_corr_run_summary.json", "w", encoding="utf-8") as f:
@@ -1052,6 +1159,562 @@ def make_units_dict_from_spikes_object(spikes: Any,
     return out
 
 
+# =============================================================================
+# SIGNIFICATIVITÉ ET FIGURES DE DISTRIBUTION DES CORRÉLATIONS
+# =============================================================================
+
+
+def get_significant_correlations(corr_df: pd.DataFrame,
+                                 p_col: str = "p_value",
+                                 alpha: float = 0.05,
+                                 method: Optional[str] = None) -> pd.DataFrame:
+    """Retourne les lignes significatives selon p_col < alpha, optionnellement pour une méthode."""
+    if corr_df is None or corr_df.empty:
+        return pd.DataFrame()
+    if p_col not in corr_df.columns:
+        raise ValueError(f"Colonne de significativité absente: {p_col}")
+    df = corr_df.copy()
+    if method is not None and "method" in df.columns:
+        df = df.loc[df["method"].astype(str) == str(method)].copy()
+    df[p_col] = pd.to_numeric(df[p_col], errors="coerce")
+    df = df.loc[np.isfinite(df[p_col]) & (df[p_col] < alpha)].copy()
+    return df.reset_index(drop=True)
+
+
+def _condition_locality_from_corr_condition(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Parse corr_condition de type 'cog+::local' ou 'cog::aphasie::distant'."""
+    s = str(value)
+    parts = s.split("::")
+    if len(parts) >= 2 and parts[-1] in {"local", "distant", "unknown"}:
+        return "::".join(parts[:-1]), parts[-1]
+    return s, None
+
+
+def _prepare_hist_df(corr_df: pd.DataFrame,
+                     p_col: str,
+                     alpha: float,
+                     method: Optional[str],
+                     corr_grouping: str,
+                     corr_condition_prefix: Optional[str] = None,
+                     corr_condition_exact: Optional[str] = None) -> pd.DataFrame:
+    df = get_significant_correlations(corr_df, p_col=p_col, alpha=alpha, method=method)
+    if df.empty:
+        return df
+    df = df.loc[df["corr_grouping"].astype(str) == corr_grouping].copy()
+    if corr_condition_exact is not None:
+        df = df.loc[df["corr_condition"].astype(str) == corr_condition_exact].copy()
+    if corr_condition_prefix is not None:
+        df = df.loc[df["corr_condition"].astype(str).str.startswith(corr_condition_prefix)].copy()
+    if df.empty:
+        return df
+    parsed = df["corr_condition"].apply(_condition_locality_from_corr_condition)
+    df["hist_condition"] = parsed.apply(lambda x: x[0])
+    df["hist_locality"] = parsed.apply(lambda x: x[1])
+    if "hist_locality" not in df.columns or df["hist_locality"].isna().all():
+        if "corr_condition" in df.columns and corr_grouping == "locality":
+            df["hist_locality"] = df["corr_condition"].astype(str)
+        elif "locality" in df.columns:
+            df["hist_locality"] = df["locality"].astype(str)
+    return df.reset_index(drop=True)
+
+
+def plot_rho_hist_grid(df: pd.DataFrame,
+                       out_file: str | Path,
+                       title: str,
+                       bands: Sequence[str],
+                       localities: Sequence[str] = ("local", "distant"),
+                       bins: int = 30,
+                       rho_col: str = "rho_or_r") -> Optional[Path]:
+    """
+    Figure de distribution des rho/r significatifs.
+
+    Colonnes = bandes de fréquence ; lignes = localités.
+    """
+    if df is None or df.empty:
+        return None
+    if rho_col not in df.columns:
+        raise ValueError(f"Colonne absente: {rho_col}")
+
+    df = df.copy()
+    df[rho_col] = pd.to_numeric(df[rho_col], errors="coerce")
+    df = df.loc[np.isfinite(df[rho_col])].copy()
+    if df.empty:
+        return None
+
+    bands = [b for b in bands if b in set(df["band"].astype(str))]
+    if len(bands) == 0:
+        return None
+    localities = list(localities)
+
+    fig, axes = plt.subplots(
+        nrows=len(localities),
+        ncols=len(bands),
+        figsize=(3.4 * len(bands), 2.8 * len(localities)),
+        squeeze=False,
+        sharex=True,
+        sharey=False,
+    )
+
+    hist_range = (-1.0, 1.0)
+    for r, loc in enumerate(localities):
+        for c, band in enumerate(bands):
+            ax = axes[r, c]
+            sub = df.loc[(df["band"].astype(str) == str(band)) & (df["hist_locality"].astype(str) == str(loc))]
+            vals = sub[rho_col].to_numpy(float)
+            vals = vals[np.isfinite(vals)]
+            if len(vals) > 0:
+                ax.hist(vals, bins=bins, range=hist_range)
+                ax.axvline(0, linestyle=":", linewidth=1.0)
+                ax.set_title(f"{band}\nN={len(vals)}", fontsize=9)
+            else:
+                ax.text(0.5, 0.5, "N=0", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(f"{band}\nN=0", fontsize=9)
+            if c == 0:
+                ax.set_ylabel(f"{loc}\ncount")
+            if r == len(localities) - 1:
+                ax.set_xlabel("rho / r")
+            ax.set_xlim(hist_range)
+
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_file, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_file
+
+
+def _available_general_effects(corr_df: pd.DataFrame) -> List[str]:
+    """Effets principaux à tracer depuis group_label_x_locality."""
+    if corr_df.empty or "corr_condition" not in corr_df.columns:
+        return []
+    sub = corr_df.loc[corr_df["corr_grouping"].astype(str) == "group_label_x_locality"].copy()
+    labels = []
+    for cond in sub["corr_condition"].dropna().astype(str).unique():
+        effect, loc = _condition_locality_from_corr_condition(cond)
+        if loc in {"local", "distant"} and effect not in labels:
+            labels.append(effect)
+    preferred = [x for x in ["cog+", "negatif", "controle"] if x in labels]
+    rest = sorted([x for x in labels if x not in preferred])
+    return preferred + rest
+
+
+def _available_cog_subtypes(corr_df: pd.DataFrame) -> List[str]:
+    """Sous-types cog::label disponibles depuis cog_subcategory_x_locality."""
+    if corr_df.empty or "corr_condition" not in corr_df.columns:
+        return []
+    sub = corr_df.loc[corr_df["corr_grouping"].astype(str) == "cog_subcategory_x_locality"].copy()
+    labels = []
+    for cond in sub["corr_condition"].dropna().astype(str).unique():
+        effect, loc = _condition_locality_from_corr_condition(cond)
+        if loc in {"local", "distant"} and str(effect).startswith("cog::") and effect not in labels:
+            labels.append(effect)
+    return sorted(labels)
+
+
+def plot_significant_histograms_suite(corr_df: pd.DataFrame,
+                                      out_dir: str | Path,
+                                      prefix: str,
+                                      cfg: FRPowerCorrelationConfig,
+                                      bands: Optional[Sequence[str]] = None) -> List[Path]:
+    """
+    Génère les figures demandées sur les lignes significatives seulement :
+      1. toutes stims confondues : bande × localité ;
+      2. par effet principal : cog+, negatif, controle si disponible ;
+      3. par sous-type cog+ : cog::aphasie, cog::déjà-vu, etc.
+    """
+    out_dir = ensure_dir(out_dir)
+    if bands is None:
+        if cfg.bands_to_test is not None:
+            bands = list(cfg.bands_to_test)
+        elif corr_df is not None and not corr_df.empty and "band" in corr_df.columns:
+            bands = sorted(corr_df["band"].dropna().astype(str).unique())
+        else:
+            bands = ["theta", "alpha", "beta", "low_gamma", "high_gamma"]
+
+    p_col = cfg.histogram_significance_col
+    alpha = cfg.histogram_alpha
+    method = cfg.histogram_method
+    bins = cfg.histogram_bins
+    files: List[Path] = []
+
+    # 1) Toutes stimulations confondues, séparé par localité.
+    df_all = _prepare_hist_df(
+        corr_df,
+        p_col=p_col,
+        alpha=alpha,
+        method=method,
+        corr_grouping="locality",
+    )
+    fp = plot_rho_hist_grid(
+        df_all,
+        out_file=out_dir / f"{safe_name(prefix)}_rho_hist_SIGNIF_all_stims_by_band_x_locality.png",
+        title=f"{prefix} | signif {p_col}<{alpha} | {method} | all stims",
+        bands=bands,
+        localities=("local", "distant"),
+        bins=bins,
+    )
+    if fp is not None:
+        files.append(fp)
+
+    # 2) Effets principaux : cog+, negatif, contrôle si présent.
+    for effect in _available_general_effects(corr_df):
+        df_eff = _prepare_hist_df(
+            corr_df,
+            p_col=p_col,
+            alpha=alpha,
+            method=method,
+            corr_grouping="group_label_x_locality",
+            corr_condition_prefix=f"{effect}::",
+        )
+        fp = plot_rho_hist_grid(
+            df_eff,
+            out_file=out_dir / f"{safe_name(prefix)}_rho_hist_SIGNIF_effect_{safe_name(effect)}_by_band_x_locality.png",
+            title=f"{prefix} | signif {p_col}<{alpha} | {method} | effect={effect}",
+            bands=bands,
+            localities=("local", "distant"),
+            bins=bins,
+        )
+        if fp is not None:
+            files.append(fp)
+
+    # 3) Sous-types cog+.
+    for subtype in _available_cog_subtypes(corr_df):
+        df_sub = _prepare_hist_df(
+            corr_df,
+            p_col=p_col,
+            alpha=alpha,
+            method=method,
+            corr_grouping="cog_subcategory_x_locality",
+            corr_condition_prefix=f"{subtype}::",
+        )
+        subtype_label = subtype.replace("cog::", "")
+        fp = plot_rho_hist_grid(
+            df_sub,
+            out_file=out_dir / f"{safe_name(prefix)}_rho_hist_SIGNIF_cog_subtype_{safe_name(subtype_label)}_by_band_x_locality.png",
+            title=f"{prefix} | signif {p_col}<{alpha} | {method} | {subtype}",
+            bands=bands,
+            localities=("local", "distant"),
+            bins=bins,
+        )
+        if fp is not None:
+            files.append(fp)
+
+    return files
+
+
+# =============================================================================
+# ORCHESTRATEUR MULTI-SESSIONS / POOLING DES CORRÉLATIONS
+# =============================================================================
+
+
+@dataclass
+class PooledFRPowerCorrelationConfig:
+    """Configuration de l'orchestrateur multi-sessions."""
+
+    common_root: str
+    root_micro: str
+    output_root: str
+
+    hilbert_bands: Tuple[str, ...] = ("theta", "alpha", "beta", "low_gamma", "high_gamma")
+    session_cfg: FRPowerCorrelationConfig = field(default_factory=FRPowerCorrelationConfig)
+
+    # Vérifie qu'un .nwb existe avant d'essayer la session.
+    require_existing_nwb: bool = True
+
+    # Si True, ne relance pas une session dont le fichier correlations existe déjà.
+    skip_existing_session_outputs: bool = False
+
+    # FDR recalculé après concaténation des lignes de corrélation de toutes les sessions.
+    recompute_pooled_fdr: bool = True
+
+    # Plots pooled sur les lignes significatives seulement.
+    make_pooled_histograms: bool = True
+
+    verbose: bool = True
+
+
+def parse_session_name_for_patient_session(session_name: str) -> Tuple[str, str]:
+    """Parse 'P119_FM71_stim4' -> ('P119_FM71', '4')."""
+    m = re.match(r"^(?P<patient>.+)_stim(?P<session>\d+)$", str(session_name))
+    if not m:
+        raise ValueError(f"Nom de session non reconnu: {session_name}")
+    return m.group("patient"), m.group("session")
+
+
+def find_common_session_dirs(common_root: str | Path,
+                             hilbert_root: Optional[str | Path] = None) -> List[Path]:
+    """Liste les dossiers SESSION contenant SESSION_common_trials.csv, optionnellement présents dans hilbert_root."""
+    root = Path(common_root).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(root)
+    out = []
+    for d in sorted([p for p in root.iterdir() if p.is_dir()]):
+        trials = d / f"{d.name}_common_trials.csv"
+        meta = d / f"{d.name}_common_metadata.json"
+        if not trials.exists() or not meta.exists():
+            continue
+        if hilbert_root is not None:
+            hdir = Path(hilbert_root).expanduser().resolve() / d.name
+            if not hdir.exists():
+                continue
+        out.append(d)
+    return out
+
+
+def find_nwb_file(root_micro: str | Path,
+                  patient: str,
+                  session: str | int) -> Optional[Path]:
+    """Recherche PATIENT_stimN.nwb dans les structures micro habituelles."""
+    root = Path(root_micro).expanduser()
+    session = str(session)
+    session_name = f"{patient}_stim{session}"
+    candidates = [
+        root / "Spike-sorting" / "Data_folders" / patient / session_name / f"{session_name}.nwb",
+        root / "Data_folders" / patient / session_name / f"{session_name}.nwb",
+        root / patient / session_name / f"{session_name}.nwb",
+        root / session_name / f"{session_name}.nwb",
+    ]
+    for fp in candidates:
+        if fp.exists():
+            return fp.resolve()
+    return None
+
+
+def _root_with_trailing_sep(root: str | Path) -> str:
+    """get_nwb concatène souvent root + 'Spike-sorting/...'; on sécurise le '/' final."""
+    return str(root).rstrip("/") + "/"
+
+
+def _default_get_nwb(patient: str, session: str, root_micro: str | Path) -> Any:
+    """Appelle functions_Rasters_DF.get_nwb si disponible."""
+    try:
+        from functions_Rasters_DF import get_nwb
+    except Exception as exc:
+        raise ImportError(
+            "Impossible d'importer get_nwb depuis functions_Rasters_DF. "
+            "Passe get_nwb_func=get_nwb à run_all_available_sessions_fr_power_correlations."
+        ) from exc
+    return get_nwb(patient, str(session), _root_with_trailing_sep(root_micro))
+
+
+def _load_common_bundle_for_session(session_dir: Path,
+                                    hilbert_bands: Sequence[str]) -> CommonSessionBundle:
+    """Import dynamique pour rester compatible avec les noms/version de ton module common."""
+    try:
+        from spike_lfp_common_preprocess import load_common_session_bundle
+    except Exception:
+        from spike_lfp_common_preprocess_v3_savefix import load_common_session_bundle
+    return load_common_session_bundle(
+        session_dir,
+        load_hilbert=True,
+        hilbert_bands=hilbert_bands,
+    )
+
+
+def pool_saved_session_correlations(session_output_dirs: Sequence[str | Path],
+                                    out_dir: str | Path,
+                                    cfg: Optional[FRPowerCorrelationConfig] = None,
+                                    recompute_fdr: bool = True,
+                                    prefix: str = "ALL_SESSIONS") -> Dict[str, Any]:
+    """Concatène les tables de corrélations sauvegardées par session et génère un pooled summary."""
+    cfg = cfg or FRPowerCorrelationConfig()
+    out_dir = ensure_dir(out_dir)
+    frames = []
+    used_files = []
+    missing = []
+
+    for d in session_output_dirs:
+        d = Path(d).expanduser().resolve()
+        session = d.name
+        fp = _csv_path(d, f"{session}_fr_power_correlations", cfg.compression)
+        if not fp.exists():
+            # fallback sans compression si cfg différent de celui utilisé au run session.
+            fp_alt = d / f"{session}_fr_power_correlations.csv"
+            fp = fp_alt if fp_alt.exists() else fp
+        if not fp.exists():
+            missing.append(str(fp))
+            continue
+        df = pd.read_csv(fp, compression="infer")
+        if not df.empty:
+            frames.append(df)
+            used_files.append(str(fp))
+
+    pooled = pd.concat(frames, axis=0, ignore_index=True) if frames else pd.DataFrame()
+
+    if recompute_fdr and not pooled.empty and "p_value" in pooled.columns:
+        pooled["q_value_fdr_bh_pooled"] = np.nan
+        group_cols = [c for c in ["method", "corr_grouping"] if c in pooled.columns]
+        if group_cols:
+            for _, idx in pooled.groupby(group_cols, dropna=False).groups.items():
+                idx_arr = np.asarray(list(idx), dtype=int)
+                pooled.loc[idx_arr, "q_value_fdr_bh_pooled"] = fdr_bh(pooled.loc[idx_arr, "p_value"].to_numpy(float))
+        else:
+            pooled["q_value_fdr_bh_pooled"] = fdr_bh(pooled["p_value"].to_numpy(float))
+
+    fp_pooled = _to_csv(pooled, out_dir, f"{prefix}_fr_power_correlations_pooled", cfg.compression)
+
+    sig = get_significant_correlations(
+        pooled,
+        p_col=cfg.significance_p_col,
+        alpha=cfg.significance_alpha,
+    ) if not pooled.empty and cfg.significance_p_col in pooled.columns else pd.DataFrame()
+    fp_sig = _to_csv(sig, out_dir, f"{prefix}_fr_power_correlations_pooled_SIGNIF", cfg.compression)
+
+    fig_files = []
+    if cfg.make_significant_histograms and not pooled.empty:
+        fig_dir = ensure_dir(out_dir / "figures_significant_histograms")
+        fig_files = plot_significant_histograms_suite(
+            corr_df=pooled,
+            out_dir=fig_dir,
+            prefix=prefix,
+            cfg=cfg,
+        )
+
+    summary = {
+        "n_session_files_used": len(used_files),
+        "used_files": used_files,
+        "missing_files": missing,
+        "n_rows_pooled": int(len(pooled)),
+        "n_rows_significant": int(len(sig)),
+        "pooled_file": str(fp_pooled),
+        "pooled_significant_file": str(fp_sig),
+        "figure_files": [str(x) for x in fig_files],
+    }
+    with open(out_dir / f"{prefix}_fr_power_pool_summary.json", "w", encoding="utf-8") as f:
+        json.dump(_jsonify(summary), f, ensure_ascii=False, indent=2)
+
+    return {"pooled": pooled, "significant": sig, "summary": summary, "out_dir": out_dir}
+
+
+def run_all_available_sessions_fr_power_correlations(pool_cfg: PooledFRPowerCorrelationConfig,
+                                                     get_nwb_func: Optional[Any] = None,
+                                                     unit_metadata_func: Optional[Any] = None,
+                                                     dead_intervals_func: Optional[Any] = None) -> Dict[str, Any]:
+    """
+    Lance spike–power sur toutes les sessions common disponibles, si le NWB existe.
+
+    Parameters
+    ----------
+    pool_cfg : PooledFRPowerCorrelationConfig
+        Contient common_root, root_micro, output_root et session_cfg.
+    get_nwb_func : callable optionnel
+        Fonction compatible get_nwb(patient, session, root_micro). Si None, essaie
+        d'importer functions_Rasters_DF.get_nwb.
+    unit_metadata_func : callable optionnel
+        unit_metadata_func(patient, session, spikes) -> DataFrame avec colonne unit_id.
+    dead_intervals_func : callable optionnel
+        dead_intervals_func(patient, session, spikes) -> dict {unit_id: intervals n×2}.
+    """
+    cfg = pool_cfg.session_cfg
+    output_root = ensure_dir(pool_cfg.output_root)
+    session_out_root = ensure_dir(output_root / "per_session")
+    pooled_out = ensure_dir(output_root / "pooled_across_sessions")
+
+    # Si possible, on filtre sur le hilbert_root lu depuis metadata, mais common_root suffit.
+    common_dirs = find_common_session_dirs(pool_cfg.common_root)
+    if len(common_dirs) == 0:
+        raise RuntimeError(f"Aucun common bundle trouvé dans {pool_cfg.common_root}")
+
+    get_nwb_func = get_nwb_func or _default_get_nwb
+
+    session_output_dirs: List[Path] = []
+    rows_summary: List[Dict[str, Any]] = []
+    errors: List[Tuple[str, str]] = []
+    skipped: List[Tuple[str, str]] = []
+
+    for session_dir in common_dirs:
+        session_name = session_dir.name
+        try:
+            patient, session = parse_session_name_for_patient_session(session_name)
+        except Exception as exc:
+            skipped.append((session_name, f"parse_session_name_failed: {exc}"))
+            continue
+
+        nwb_fp = find_nwb_file(pool_cfg.root_micro, patient, session)
+        if pool_cfg.require_existing_nwb and nwb_fp is None:
+            skipped.append((session_name, "NWB absent"))
+            continue
+
+        out_session_dir = session_out_root / session_name
+        corr_fp = _csv_path(out_session_dir, f"{session_name}_fr_power_correlations", cfg.compression)
+        if pool_cfg.skip_existing_session_outputs and corr_fp.exists():
+            session_output_dirs.append(out_session_dir)
+            rows_summary.append({
+                "session": session_name,
+                "patient": patient,
+                "session_num": session,
+                "status": "skipped_existing",
+                "nwb_file": str(nwb_fp) if nwb_fp is not None else None,
+                "out_dir": str(out_session_dir),
+            })
+            continue
+
+        try:
+            log(f"\n=== FR-power multi-session | {session_name} ===", pool_cfg.verbose)
+            bundle = _load_common_bundle_for_session(session_dir, pool_cfg.hilbert_bands)
+            spikes = get_nwb_func(patient, str(session), _root_with_trailing_sep(pool_cfg.root_micro))
+            units = make_units_dict_from_spikes_object(spikes)
+
+            unit_metadata = unit_metadata_func(patient, str(session), spikes) if unit_metadata_func is not None else None
+            dead_intervals_by_unit = dead_intervals_func(patient, str(session), spikes) if dead_intervals_func is not None else None
+
+            out = run_session_fr_power_correlations(
+                bundle=bundle,
+                units=units,
+                out_dir=session_out_root,
+                cfg=cfg,
+                dead_intervals_by_unit=dead_intervals_by_unit,
+                unit_metadata=unit_metadata,
+            )
+            session_output_dirs.append(Path(out["session_out"]))
+            rows_summary.append({
+                "session": session_name,
+                "patient": patient,
+                "session_num": session,
+                "status": "ok",
+                "nwb_file": str(nwb_fp) if nwb_fp is not None else None,
+                "out_dir": str(out["session_out"]),
+                "n_units": int(out["summary"].get("n_units_input", 0)),
+                "n_correlation_rows": int(out["summary"].get("n_correlation_rows", 0)),
+                "n_significant_rows": int(out["summary"].get("n_significant_rows", 0)),
+            })
+        except Exception as exc:
+            errors.append((session_name, repr(exc)))
+            log(f"[ERROR] {session_name}: {exc}", pool_cfg.verbose)
+
+    pool_result = pool_saved_session_correlations(
+        session_output_dirs=session_output_dirs,
+        out_dir=pooled_out,
+        cfg=cfg,
+        recompute_fdr=pool_cfg.recompute_pooled_fdr,
+        prefix="ALL_SESSIONS",
+    ) if len(session_output_dirs) > 0 else {"summary": {}, "pooled": pd.DataFrame(), "significant": pd.DataFrame()}
+
+    run_summary = {
+        "config": _jsonify(asdict(pool_cfg)),
+        "n_common_sessions_found": len(common_dirs),
+        "n_sessions_run_or_reused": len(session_output_dirs),
+        "n_skipped": len(skipped),
+        "skipped": skipped,
+        "n_errors": len(errors),
+        "errors": errors,
+        "pooled_summary": pool_result.get("summary", {}),
+    }
+    with open(output_root / "run_all_fr_power_correlations_summary.json", "w", encoding="utf-8") as f:
+        json.dump(_jsonify(run_summary), f, ensure_ascii=False, indent=2)
+
+    pd.DataFrame(rows_summary).to_csv(output_root / "run_all_fr_power_correlations_sessions.csv", index=False)
+
+    return {
+        "session_summary": pd.DataFrame(rows_summary),
+        "pooled": pool_result.get("pooled", pd.DataFrame()),
+        "pooled_significant": pool_result.get("significant", pd.DataFrame()),
+        "run_summary": run_summary,
+        "output_root": output_root,
+    }
+
+
 __all__ = [
     "FRPowerCorrelationConfig",
     "make_relative_bin_table",
@@ -1062,4 +1725,11 @@ __all__ = [
     "compute_correlations_from_trial_bin_table",
     "run_session_fr_power_correlations",
     "make_units_dict_from_spikes_object",
+    "PooledFRPowerCorrelationConfig",
+    "find_common_session_dirs",
+    "find_nwb_file",
+    "run_all_available_sessions_fr_power_correlations",
+    "pool_saved_session_correlations",
+    "get_significant_correlations",
+    "plot_significant_histograms_suite",
 ]
