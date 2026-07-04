@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-spike_lfp_common_preprocess.py
-==============================
+spike_lfp_common_preprocess_session.py
+======================================
 
 Base commune de prétraitement pour les analyses spike–LFP après SEIC.
 
@@ -164,9 +164,25 @@ def log(msg: str, verbose: bool = True) -> None:
 
 
 def ensure_dir(path: str | Path) -> Path:
-    path = Path(path)
+    """Crée un dossier et retourne son chemin absolu résolu."""
+    path = Path(path).expanduser()
     path.mkdir(parents=True, exist_ok=True)
-    return path
+    return path.resolve()
+
+
+def _jsonify(obj: Any) -> Any:
+    """Convertit récursivement Path/numpy/list/dict en objets JSON natifs."""
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {str(k): _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_jsonify(v) for v in obj]
+    return obj
 
 
 def safe_name(name: str) -> str:
@@ -912,8 +928,8 @@ def add_common_trial_windows(trials: pd.DataFrame,
         out[f"pre_end_{ref}"] = t0 - epsilon
         out[f"post_start_{ref}"] = t1 + epsilon
         out[f"post_end_{ref}"] = t1 + epsilon + post_length
-        # out[f"stim_start_{ref}"] = t0
-        # out[f"stim_end_{ref}"] = t1
+        out[f"stim_start_{ref}"] = t0
+        out[f"stim_end_{ref}"] = t1
 
     out["pre_length"] = float(pre_length)
     out["post_length"] = float(post_length)
@@ -934,6 +950,256 @@ def keep_trials_with_valid_windows(trials: pd.DataFrame,
         keep &= trials["post_end_macro"].to_numpy(float) <= float(macro_duration_s)
     return trials.loc[keep].reset_index(drop=True)
 
+
+
+# =============================================================================
+# DEADFILES MICRO / MAPPING TÉTRODES
+# =============================================================================
+
+
+def get_SR(patient: str) -> int:
+    """Fréquence d'échantillonnage micro en Hz, selon la convention patient."""
+    pat_num = int(str(patient)[1:-5])
+    if pat_num <= 75:
+        if pat_num < 65:
+            return 30000
+        return 16384
+    return 32768
+
+
+def normalize_electrode_name_project(name: str) -> str:
+    """
+    Normalise les noms d'électrodes micro/macro vers RADICAL_LAT.
+
+    Micro : va, va1 -> A_L ; dtp, dtp2 -> TP_R.
+    Macro : A -> A_R ; B' / Bp / B_p -> B_L ; TP_ -> TP_R.
+    """
+    name = str(name).strip()
+    if name == "" or name.lower() == "nan":
+        raise ValueError(f"Nom d'électrode vide/non reconnu: {name!r}")
+
+    # Micro : minuscules, préfixe v/d pour latéralité, suffixe numérique optionnel.
+    if name.islower():
+        side = "L" if name.startswith("v") else "R" if name.startswith("d") else None
+        if side is None:
+            raise ValueError(f"Nom micro invalide: {name}")
+        core = re.sub(r"^[vd]", "", name)
+        core = re.sub(r"\d+$", "", core)
+        if len(core) == 3:
+            core = core[:2]
+        return f"{core.upper()}_{side}"
+
+    # Macro : radical majuscule, suffixes gauches possibles p, _p, p_, apostrophe.
+    if re.match(r"^[A-Za-z]{1,3}(_p|_|p_|p|'|)$", name):
+        core0 = name.upper().replace("'", "p")
+        if core0.endswith("_P") or core0.endswith("P_") or core0.endswith("P"):
+            side = "L"
+            core = re.sub(r"(_?P|P_)$", "", core0)
+            core = re.sub(r"_$", "", core)
+        else:
+            side = "R"
+            core = re.sub(r"_$", "", core0)
+        if len(core) == 3:
+            core = core[:2]
+        return f"{core}_{side}"
+
+    raise ValueError(f"Nom d'électrode non reconnu: {name}")
+
+
+def electrodes_equal(name1: str, name2: str) -> bool:
+    """Compare deux noms micro/macro en tenant compte des conventions latéralité."""
+    return normalize_electrode_name_project(name1) == normalize_electrode_name_project(name2)
+
+
+def merge_overlapping_intervals_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Fusionne des intervalles chevauchants dans une table colonnes 0/1, en secondes."""
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=[0, 1], dtype=float)
+    arr = df.iloc[:, :2].astype(float).to_numpy()
+    arr = arr[np.all(np.isfinite(arr), axis=1)]
+    arr = arr[arr[:, 1] > arr[:, 0]]
+    if arr.size == 0:
+        return pd.DataFrame(columns=[0, 1], dtype=float)
+    arr = arr[np.argsort(arr[:, 0])]
+    merged = []
+    cur_s, cur_e = float(arr[0, 0]), float(arr[0, 1])
+    for s, e in arr[1:]:
+        s, e = float(s), float(e)
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            merged.append([cur_s, cur_e])
+            cur_s, cur_e = s, e
+    merged.append([cur_s, cur_e])
+    return pd.DataFrame(merged, columns=[0, 1])
+
+
+def find_mapping_anat_file(root_micro: str | Path, patient: str) -> Path:
+    """Trouve mapping_anat_PATIENT.txt dans les structures micro usuelles."""
+    root = Path(root_micro).expanduser()
+    candidates = [
+        root / "Spike-sorting" / "Data_folders" / patient / f"mapping_anat_{patient}.txt",
+        root / "Data_folders" / patient / f"mapping_anat_{patient}.txt",
+        root / patient / f"mapping_anat_{patient}.txt",
+    ]
+    for fp in candidates:
+        if fp.exists():
+            return fp.resolve()
+    raise FileNotFoundError("mapping_anat introuvable. Candidats:\n" + "\n".join(str(c) for c in candidates))
+
+
+def load_mapping_anat(root_micro: str | Path, patient: str) -> pd.DataFrame:
+    """Charge mapping_anat_PATIENT.txt."""
+    fp = find_mapping_anat_file(root_micro, patient)
+    return pd.read_csv(fp, sep=",", engine="python")
+
+
+def load_deadfiles_by_electrode(patient: str,
+                                session: str | int,
+                                root_micro: str | Path,
+                                sr: Optional[float] = None,
+                                mapping_anat: Optional[pd.DataFrame] = None,
+                                missing: Literal["empty", "raise"] = "empty") -> Dict[str, pd.DataFrame]:
+    """
+    Charge les deadfiles micro par électrode hybride/tétrode, en secondes.
+
+    Fichiers attendus :
+        PATIENT_stimN/derivatives/PATIENT_stimN_deadfile_<elec>_in_ts.txt
+
+    Les fichiers sont en indices de samples et sont divisés par sr.
+    Retour : dict {elec_micro: DataFrame columns [0,1] en secondes}.
+    """
+    session_num = str(session).replace("stim", "")
+    session_name = f"{patient}_stim{session_num}"
+    sr = float(sr if sr is not None else get_SR(patient))
+    micro_dir = find_micro_session_dir(root_micro, patient, session_num, session_name)
+    deriv_dir = micro_dir / "derivatives"
+    if mapping_anat is None:
+        try:
+            mapping_anat = load_mapping_anat(root_micro, patient)
+        except FileNotFoundError:
+            mapping_anat = None
+
+    elecs: List[str] = []
+    if mapping_anat is not None and "tt" in mapping_anat.columns:
+        elecs = sorted(set(str(tt)[:-1] for tt in mapping_anat["tt"].dropna().astype(str)))
+    elif deriv_dir.exists():
+        pat = re.compile(rf"^{re.escape(session_name)}_deadfile_(?P<elec>.+?)_in_ts\.txt$")
+        for fp in deriv_dir.glob(f"{session_name}_deadfile_*_in_ts.txt"):
+            m = pat.match(fp.name)
+            if m:
+                elecs.append(m.group("elec"))
+        elecs = sorted(set(elecs))
+
+    out: Dict[str, pd.DataFrame] = {}
+    for elec in elecs:
+        fp = deriv_dir / f"{session_name}_deadfile_{elec}_in_ts.txt"
+        if not fp.exists():
+            if missing == "raise":
+                raise FileNotFoundError(fp)
+            out[elec] = pd.DataFrame(columns=[0, 1], dtype=float)
+            continue
+        raw = pd.read_csv(fp, header=None, sep="\t", engine="python")
+        if raw.empty:
+            out[elec] = pd.DataFrame(columns=[0, 1], dtype=float)
+        else:
+            out[elec] = merge_overlapping_intervals_df(raw.iloc[:, :2] / sr)
+    return out
+
+
+def get_unit_tetrode_map_from_spikes(spikes: Any, mapping_anat: pd.DataFrame) -> Dict[Any, str]:
+    """
+    Mappe unit_id -> nom de tétrade (ex. clu -> 'vcr1') depuis un objet pynapple/NWB.
+    """
+    if "tt" not in mapping_anat.columns:
+        raise ValueError("mapping_anat doit contenir une colonne 'tt'")
+    dict_ttInd2tt = {i + 1: mapping_anat.loc[i, "tt"] for i in range(mapping_anat.shape[0])}
+    out: Dict[Any, str] = {}
+    try:
+        spikes_by_location = spikes.getby_category("group")
+        for ttInd in spikes_by_location.keys():
+            for clu in spikes_by_location[int(ttInd)].index:
+                out[clu] = dict_ttInd2tt[int(ttInd)]
+        return out
+    except Exception:
+        pass
+
+    # Fallback : si spikes expose une table units avec group, essayer un accès générique.
+    if hasattr(spikes, "index") and hasattr(spikes, "group"):
+        for clu, group in zip(spikes.index, spikes.group):
+            if int(group) in dict_ttInd2tt:
+                out[clu] = dict_ttInd2tt[int(group)]
+    return out
+
+
+def build_unit_metadata_from_spikes(patient: str,
+                                    session: str | int,
+                                    root_micro: str | Path,
+                                    spikes: Any,
+                                    mapping_anat: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Construit une petite table unit_id/tetrode/electrode_micro pour propager la topo."""
+    if mapping_anat is None:
+        mapping_anat = load_mapping_anat(root_micro, patient)
+    unit2tt = get_unit_tetrode_map_from_spikes(spikes, mapping_anat)
+    rows = []
+    for unit_id, tt in unit2tt.items():
+        row = {"unit_id": unit_id, "tetrode": tt, "electrode_micro": str(tt)[:-1]}
+        if "lobe" in mapping_anat.columns:
+            vals = mapping_anat.loc[mapping_anat["tt"].astype(str) == str(tt), "lobe"]
+            row["lobe_tt"] = vals.iloc[0] if len(vals) else np.nan
+        if "loca" in mapping_anat.columns:
+            vals = mapping_anat.loc[mapping_anat["tt"].astype(str) == str(tt), "loca"]
+            row["loca_tt"] = vals.iloc[0] if len(vals) else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_dead_intervals_by_unit(patient: str,
+                                 session: str | int,
+                                 root_micro: str | Path,
+                                 spikes: Any,
+                                 mapping_anat: Optional[pd.DataFrame] = None,
+                                 sr: Optional[float] = None) -> Dict[Any, pd.DataFrame]:
+    """
+    Retourne {unit_id: dead_intervals_en_secondes} à partir de mapping_anat + deadfiles.
+    """
+    if mapping_anat is None:
+        mapping_anat = load_mapping_anat(root_micro, patient)
+    unit2tt = get_unit_tetrode_map_from_spikes(spikes, mapping_anat)
+    elec2dead = load_deadfiles_by_electrode(
+        patient=patient,
+        session=session,
+        root_micro=root_micro,
+        sr=sr,
+        mapping_anat=mapping_anat,
+        missing="empty",
+    )
+    out: Dict[Any, pd.DataFrame] = {}
+    for unit_id, tt in unit2tt.items():
+        elec = str(tt)[:-1]
+        out[unit_id] = elec2dead.get(elec, pd.DataFrame(columns=[0, 1], dtype=float))
+    return out
+
+
+def intervals_overlap_duration(t0: float, t1: float, intervals: Optional[np.ndarray | pd.DataFrame]) -> float:
+    """Durée totale de chevauchement entre [t0,t1) et une liste d'intervalles."""
+    if intervals is None:
+        return 0.0
+    if isinstance(intervals, pd.DataFrame):
+        if intervals.empty:
+            return 0.0
+        arr = intervals.iloc[:, :2].to_numpy(float)
+    else:
+        arr = np.asarray(intervals, dtype=float)
+        if arr.size == 0:
+            return 0.0
+        arr = arr.reshape(-1, 2)
+    total = 0.0
+    for s, e in arr:
+        if not np.isfinite(s) or not np.isfinite(e) or e <= s:
+            continue
+        total += max(0.0, min(float(t1), float(e)) - max(float(t0), float(s)))
+    return float(total)
 
 # =============================================================================
 # HILBERT EXPORTS : CHARGEMENT / INDEXAGE
@@ -1279,14 +1545,31 @@ def prepare_common_session(patient: Optional[str] = None,
 # =============================================================================
 
 
-def save_common_session_bundle(bundle: CommonSessionBundle, out_dir: str | Path) -> Path:
-    """Sauvegarde trials + metadata/offset dans un dossier session."""
+def save_common_session_bundle(bundle: CommonSessionBundle,
+                               out_dir: str | Path,
+                               overwrite: bool = True) -> Path:
+    """
+    Sauvegarde trials + metadata/offset dans un dossier session.
+
+    Structure :
+        out_dir/SESSION/SESSION_common_trials.csv
+        out_dir/SESSION/SESSION_common_metadata.json
+
+    Si overwrite=False et que les deux fichiers existent déjà, la fonction retourne
+    le dossier sans réécrire.
+    """
     out_root = ensure_dir(out_dir)
     session_out = ensure_dir(out_root / bundle.session_name)
+    trials_fp = session_out / f"{bundle.session_name}_common_trials.csv"
+    meta_fp = session_out / f"{bundle.session_name}_common_metadata.json"
+
+    if not overwrite and trials_fp.exists() and meta_fp.exists():
+        return session_out
+
     trials_to_save = bundle.trials.copy()
     if "cog_labels" in trials_to_save.columns:
         trials_to_save["cog_labels"] = trials_to_save["cog_labels"].apply(lambda x: repr(x) if isinstance(x, list) else x)
-    trials_to_save.to_csv(session_out / f"{bundle.session_name}_common_trials.csv", index=False)
+    trials_to_save.to_csv(trials_fp, index=False)
 
     meta = {
         "patient": bundle.patient,
@@ -1298,9 +1581,16 @@ def save_common_session_bundle(bundle: CommonSessionBundle, out_dir: str | Path)
         "columns": list(bundle.trials.columns),
         "hilbert_loaded": bundle.hilbert is not None,
         "hilbert_bands_loaded": list(bundle.hilbert["epochs_by_band"].keys()) if bundle.hilbert is not None else [],
+        "saved_files": {
+            "common_trials_csv": str(trials_fp),
+            "common_metadata_json": str(meta_fp),
+        },
     }
-    with open(session_out / f"{bundle.session_name}_common_metadata.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+    with open(meta_fp, "w", encoding="utf-8") as f:
+        json.dump(_jsonify(meta), f, ensure_ascii=False, indent=2)
+
+    if not trials_fp.exists() or not meta_fp.exists():
+        raise FileNotFoundError(f"Échec de sauvegarde du common bundle dans {session_out}")
     return session_out
 
 
@@ -1308,7 +1598,7 @@ def load_common_session_bundle(session_dir: str | Path,
                                load_hilbert: bool = False,
                                hilbert_bands: Optional[Sequence[str]] = None) -> CommonSessionBundle:
     """Recharge un bundle sauvegardé par save_common_session_bundle."""
-    session_dir = Path(session_dir)
+    session_dir = Path(session_dir).expanduser().resolve()
     session_name = session_dir.name
     trials_fp = session_dir / f"{session_name}_common_trials.csv"
     meta_fp = session_dir / f"{session_name}_common_metadata.json"
@@ -1410,6 +1700,17 @@ __all__ = [
     "parse_bipolar_shaft",
     "channel_locality_for_trial",
     "build_channel_trial_locality_table",
+    "get_SR",
+    "normalize_electrode_name_project",
+    "electrodes_equal",
+    "merge_overlapping_intervals_df",
+    "find_mapping_anat_file",
+    "load_mapping_anat",
+    "load_deadfiles_by_electrode",
+    "get_unit_tetrode_map_from_spikes",
+    "build_unit_metadata_from_spikes",
+    "build_dead_intervals_by_unit",
+    "intervals_overlap_duration",
     "prepare_common_session",
     "save_common_session_bundle",
     "load_common_session_bundle",

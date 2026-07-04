@@ -54,23 +54,30 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter1d
 from scipy.stats import pearsonr, spearmanr
 
-from utils_spike_lfp.spike_lfp_common_preprocess import (
+from utils_spike_lfp.spike_lfp_common_preprocess_session import (
     CommonSessionBundle,
     as_spike_times_array,
     get_spikes_in_interval,
     parse_bipolar_shaft,
     channel_locality_for_trial,
     safe_name,
+    get_nwb,
+    load_common_session_bundle,
+    build_dead_intervals_by_unit,
+    build_unit_metadata_from_spikes,
+    intervals_overlap_duration,
 )
+
 
 # =============================================================================
 # CONFIGURATION
@@ -108,17 +115,11 @@ class FRPowerCorrelationConfig:
 
     # LFP utilisé dans la corrélation. Par défaut : valeur Hilbert exportée/binée.
     # Les colonnes LFP normalisées par baseline pré-trial sont aussi calculées.
-    lfp_value_col: LFPValueColumn = "lfp_power_bin_mean" 
-            # Valeurs dispo : 
-            # "lfp_power_bin_mean"        # niveau moyen brut/normalisé session selon ton Hilbert
-            # "lfp_power_pre_subtract"    # LFP_bin - LFP_pre
-            # "lfp_power_pre_percent"     # % relatif au pré
-            # "lfp_power_pre_logratio"    # log((LFP_bin + eps)/(LFP_pre + eps))
-            # "lfp_power_pre_zscore"      # z-score vs pré-trial
+    lfp_value_col: LFPValueColumn = "lfp_power_pre_logratio"
     epsilon_lfp: float = 1e-12
 
     # Méthodes de corrélation et seuils minimaux.
-    correlation_methods: Tuple[CorrelationMethod, ...] = ("spearman", "pearson")
+    correlation_methods: Tuple[CorrelationMethod, ...] = ("spearman",) # teste une relation monotone, pas forcément linéaire, contrairement au Pearson
     min_trials_for_corr: int = 6
     min_finite_pairs_for_corr: int = 6
 
@@ -148,6 +149,9 @@ class FRPowerCorrelationConfig:
     # le lissage rectangulaire. gaussian_bins lisse sur les bins adjacents.
     smoothing_method: SmoothingMethod = "boxcar_bin"
     gaussian_sigma_bins: float = 1.0
+    # Alternative plus interprétable : sigma en millisecondes. Si renseigné,
+    # sigma_bins = gaussian_sigma_ms / bin_width_ms pour chaque largeur de bin.
+    gaussian_sigma_ms: Optional[float] = None
 
     # Sauvegardes.
     save_trial_bin_tables: bool = True
@@ -166,6 +170,16 @@ class FRPowerCorrelationConfig:
     histogram_significance_col: str = "p_value"
     histogram_alpha: float = 0.05
     histogram_bins: int = 30
+
+    # Deadfiles micro : si un bin chevauche une dead period de la tétrade du neurone,
+    # on l'invalide pour éviter de transformer un artefact supprimé en FR=0.
+    exclude_bins_overlapping_dead: bool = True
+    min_valid_bin_fraction: float = 1.0
+    use_deadfiles: bool = True
+
+    # Reuse/overwrite des sorties session.
+    overwrite: bool = True
+    reuse_existing_if_available: bool = False
 
     # Divers.
     verbose: bool = True
@@ -236,6 +250,48 @@ def _to_csv(df: pd.DataFrame, out_dir: Path, basename: str, compression: Optiona
     fp = _csv_path(out_dir, basename, compression)
     df.to_csv(fp, index=False, compression=compression)
     return fp
+
+
+def existing_session_corr_outputs(session_out: Path,
+                                  session_name: str,
+                                  cfg: FRPowerCorrelationConfig) -> Dict[str, Path]:
+    """Chemins attendus pour les sorties principales d'une session."""
+    return {
+        "correlations": _csv_path(session_out, f"{session_name}_fr_power_correlations", cfg.compression),
+        "significant": _csv_path(session_out, f"{session_name}_fr_power_correlation_signif", cfg.compression),
+        "config": session_out / f"{session_name}_fr_power_corr_config.json",
+        "summary": session_out / f"{session_name}_fr_power_corr_run_summary.json",
+    }
+
+
+def load_existing_session_fr_power_result(session_out: Path,
+                                          session_name: str,
+                                          cfg: FRPowerCorrelationConfig) -> Dict[str, Any]:
+    """Recharge une table session déjà calculée, sans recalculer spikes/LFP."""
+    fps = existing_session_corr_outputs(session_out, session_name, cfg)
+    if not fps["correlations"].exists():
+        raise FileNotFoundError(fps["correlations"])
+    corr = pd.read_csv(fps["correlations"], compression="infer")
+    if fps["significant"].exists():
+        sig = pd.read_csv(fps["significant"], compression="infer")
+    elif cfg.significance_p_col in corr.columns:
+        sig = get_significant_correlations(corr, p_col=cfg.significance_p_col, alpha=cfg.significance_alpha)
+    else:
+        sig = pd.DataFrame()
+    summary = {
+        "session": session_name,
+        "reused_existing": True,
+        "n_correlation_rows": int(len(corr)),
+        "n_significant_rows": int(len(sig)),
+        "saved_files": {k: str(v) if v.exists() else None for k, v in fps.items()},
+    }
+    return {
+        "session_out": session_out,
+        "fr_table": pd.DataFrame(),
+        "correlations": corr,
+        "saved_files": summary["saved_files"],
+        "summary": summary,
+    }
 
 
 # =============================================================================
@@ -352,10 +408,24 @@ def gaussian_smooth_1d_nanaware(x: np.ndarray, sigma_bins: float) -> np.ndarray:
 
 def smooth_rates_within_windows(fr_df: pd.DataFrame,
                                 method: SmoothingMethod,
-                                sigma_bins: float) -> pd.DataFrame:
-    """Lisse fr_hz séparément dans la fenêtre pré et post, par unit×trial×bin_width."""
+                                sigma_bins: float,
+                                sigma_ms: Optional[float] = None) -> pd.DataFrame:
+    """Lisse fr_hz séparément dans la fenêtre pré et post, par unit×trial×bin_width.
+
+    Notes
+    -----
+    - ``boxcar_bin`` : pas de lissage additionnel ; le bin lui-même est le lissage
+      rectangulaire. C'est le choix recommandé pour commencer.
+    - ``gaussian_bins`` : lissage sur bins adjacents. Si ``sigma_ms`` est fourni,
+      il est converti pour chaque largeur de bin : ``sigma_bins = sigma_ms / bin_width_ms``.
+      Sinon, la valeur historique ``gaussian_sigma_bins`` est utilisée.
+    """
     out = fr_df.copy()
     out["fr_hz_smooth"] = out["fr_hz"].astype(float)
+    out["fr_smoothing_method"] = method
+    out["fr_smoothing_sigma_bins"] = np.nan
+    out["fr_smoothing_sigma_ms"] = sigma_ms if sigma_ms is not None else np.nan
+
     if method in {"none", "boxcar_bin"}:
         return out
     if method != "gaussian_bins":
@@ -366,7 +436,10 @@ def smooth_rates_within_windows(fr_df: pd.DataFrame,
         idx_arr = np.asarray(list(idx), dtype=int)
         idx_arr = idx_arr[np.argsort(out.loc[idx_arr, "bin_index_in_window"].to_numpy())]
         vals = out.loc[idx_arr, "fr_hz"].to_numpy(float)
-        out.loc[idx_arr, "fr_hz_smooth"] = gaussian_smooth_1d_nanaware(vals, sigma_bins=sigma_bins)
+        bin_width_ms = float(out.loc[idx_arr[0], "bin_width_ms"]) if len(idx_arr) > 0 else np.nan
+        sigma_use = float(sigma_ms) / bin_width_ms if sigma_ms is not None and bin_width_ms > 0 else float(sigma_bins)
+        out.loc[idx_arr, "fr_smoothing_sigma_bins"] = sigma_use
+        out.loc[idx_arr, "fr_hz_smooth"] = gaussian_smooth_1d_nanaware(vals, sigma_bins=sigma_use)
     return out
 
 
@@ -457,9 +530,23 @@ def build_fr_bin_table_for_units(bundle: CommonSessionBundle,
                         b0=float(b["bin_start_rel"]),
                         b1=float(b["bin_end_rel"]),
                     )
-                    spk_bin = get_spikes_in_interval(spk, t0, t1, dead_intervals=dead)
+                    dead_overlap_s = intervals_overlap_duration(t0, t1, dead) if dead is not None else 0.0
                     dur = max(float(t1 - t0), np.finfo(float).eps)
-                    n_spikes = int(len(spk_bin))
+                    valid_fraction = max(0.0, (dur - dead_overlap_s) / dur)
+                    bin_valid = True
+                    if cfg.exclude_bins_overlapping_dead and dead_overlap_s > 0:
+                        bin_valid = False
+                    if valid_fraction < float(cfg.min_valid_bin_fraction):
+                        bin_valid = False
+
+                    if bin_valid:
+                        spk_bin = get_spikes_in_interval(spk, t0, t1, dead_intervals=dead)
+                        n_spikes = int(len(spk_bin))
+                        fr_hz = n_spikes / dur
+                    else:
+                        n_spikes = np.nan
+                        fr_hz = np.nan
+
                     rows.append({
                         "session": bundle.session_name,
                         "unit_id": unit_id,
@@ -480,8 +567,11 @@ def build_fr_bin_table_for_units(bundle: CommonSessionBundle,
                         "bin_duration_s": float(b["bin_duration_s"]),
                         "bin_abs_start_micro": float(t0),
                         "bin_abs_end_micro": float(t1),
+                        "dead_overlap_s": float(dead_overlap_s),
+                        "valid_bin_fraction": float(valid_fraction),
+                        "bin_valid_after_deadfile": bool(bin_valid),
                         "n_spikes": n_spikes,
-                        "fr_hz": n_spikes / dur,
+                        "fr_hz": fr_hz,
                     })
 
     fr = pd.DataFrame(rows)
@@ -492,6 +582,7 @@ def build_fr_bin_table_for_units(bundle: CommonSessionBundle,
         fr,
         method=cfg.smoothing_method,
         sigma_bins=cfg.gaussian_sigma_bins,
+        sigma_ms=cfg.gaussian_sigma_ms,
     )
     fr = normalize_fr_by_trial_pre(
         fr,
@@ -954,7 +1045,7 @@ def run_session_fr_power_correlations(bundle: CommonSessionBundle,
     units : dict
         {unit_id: spike_times_s}. Les temps doivent être en référentiel micro.
     out_dir : str | Path
-        Dossier racine de sortie. Le module créera out_dir/SESSION/.
+        Dossier racine de sortie. Le module créera out_dir/SESSION/. {/per_session/ est en fait deja renseigné dans out_dir}
     cfg : FRPowerCorrelationConfig
         Configuration.
     dead_intervals_by_unit : dict optionnel
@@ -969,14 +1060,24 @@ def run_session_fr_power_correlations(bundle: CommonSessionBundle,
     cfg = cfg or FRPowerCorrelationConfig()
     if bundle.hilbert is None:
         raise ValueError("bundle.hilbert est None. Recharge avec load_common_session_bundle(..., load_hilbert=True).")
+    
+    session_out = ensure_dir(Path(out_dir).expanduser() / "per_session" / bundle.session_name)
+    existing = existing_session_corr_outputs(session_out, bundle.session_name, cfg)
+    can_reuse = (
+        cfg.reuse_existing_if_available
+        and not cfg.overwrite
+        and existing["correlations"].exists()
+    )
+    if can_reuse:
+        log(f"[REUSE] {bundle.session_name}: corrélations existantes -> {existing['correlations']}", cfg.verbose)
+        return load_existing_session_fr_power_result(session_out, bundle.session_name, cfg)
 
-    session_out = ensure_dir(Path(out_dir).expanduser() / bundle.session_name)
     _write_config(session_out, cfg, bundle)
-
+    
     bands = _infer_bands_to_test(bundle, cfg)
     if len(bands) == 0:
         raise RuntimeError("Aucune bande Hilbert exploitable.")
-
+    
     bin_tables = {
         float(ms): make_relative_bin_table(
             pre_length=float(bundle.trials["pre_end_micro"].iloc[0] - bundle.trials["pre_start_micro"].iloc[0]),
@@ -986,7 +1087,7 @@ def run_session_fr_power_correlations(bundle: CommonSessionBundle,
         )
         for ms in cfg.bin_width_ms_options
     }
-
+    
     log(f"[INFO] {bundle.session_name}: calcul FR biné pour {len(units)} unités", cfg.verbose)
     fr_df = build_fr_bin_table_for_units(
         bundle=bundle,
@@ -1159,6 +1260,28 @@ def make_units_dict_from_spikes_object(spikes: Any,
     return out
 
 
+
+def prepare_unit_metadata_and_dead_intervals(patient: str,
+                                             session: str | int,
+                                             root_micro: str | Path,
+                                             spikes: Any,
+                                             use_deadfiles: bool = True) -> Tuple[pd.DataFrame, Optional[Dict[Any, Any]]]:
+    """
+    Helper pour un run session unique.
+
+    Retourne :
+        unit_metadata, dead_intervals_by_unit
+
+    dead_intervals_by_unit vaut None si use_deadfiles=False ou si les fichiers/mapping
+    ne sont pas disponibles.
+    """
+    unit_metadata = build_unit_metadata_from_spikes(patient, str(session), root_micro, spikes)
+    dead_intervals_by_unit = None
+    if use_deadfiles:
+        dead_intervals_by_unit = build_dead_intervals_by_unit(patient, str(session), root_micro, spikes)
+    return unit_metadata, dead_intervals_by_unit
+
+
 # =============================================================================
 # SIGNIFICATIVITÉ ET FIGURES DE DISTRIBUTION DES CORRÉLATIONS
 # =============================================================================
@@ -1283,6 +1406,170 @@ def plot_rho_hist_grid(df: pd.DataFrame,
     plt.close(fig)
     return out_file
 
+def plot_effect_overlay_rho_hist_lines(
+    corr_df: pd.DataFrame,
+    out_file: str | Path,
+    cfg: FRPowerCorrelationConfig,
+    bands: Optional[Sequence[str]] = None,
+    localities: Sequence[str] = ("local", "distant"),
+    effects: Sequence[str] = ("cog+", "controle", "negatif"),
+    effect_colors: Optional[Dict[str, str]] = None,
+    bins: Optional[int] = None,
+    smooth_sigma_bins: float = 1.2,
+    density: bool = True,
+    rho_col: str = "rho_or_r",
+) -> Optional[Path]:
+    """
+    Trace une figure de distributions rho/r significatifs avec courbes superposées.
+
+    Colonnes = bandes.
+    Lignes = localité.
+    Courbes = effets principaux : cog+, controle, negatif.
+
+    Utilise les lignes corr_grouping == 'group_label_x_locality',
+    donc corr_condition doit être du type :
+        cog+::local
+        controle::distant
+        negatif::local
+    """
+    if corr_df is None or corr_df.empty:
+        return None
+
+    p_col = cfg.histogram_significance_col
+    alpha = cfg.histogram_alpha
+    method = cfg.histogram_method
+    bins = bins or cfg.histogram_bins
+
+    if effect_colors is None:
+        effect_colors = {
+            "cog+": "red",
+            "controle": "green",
+            "negatif": "blue",
+        }
+
+    if p_col not in corr_df.columns:
+        raise ValueError(f"Colonne de significativité absente: {p_col}")
+
+    df = get_significant_correlations(
+        corr_df,
+        p_col=p_col,
+        alpha=alpha,
+        method=method,
+    )
+
+    if df.empty:
+        return None
+
+    df = df.loc[df["corr_grouping"].astype(str) == "group_label_x_locality"].copy()
+    if df.empty:
+        return None
+
+    parsed = df["corr_condition"].apply(_condition_locality_from_corr_condition)
+    df["hist_effect"] = parsed.apply(lambda x: x[0])
+    df["hist_locality"] = parsed.apply(lambda x: x[1])
+
+    df = df.loc[
+        df["hist_effect"].isin(effects)
+        & df["hist_locality"].isin(localities)
+    ].copy()
+
+    if df.empty:
+        return None
+
+    df[rho_col] = pd.to_numeric(df[rho_col], errors="coerce")
+    df = df.loc[np.isfinite(df[rho_col])].copy()
+    if df.empty:
+        return None
+
+    if bands is None:
+        if cfg.bands_to_test is not None:
+            bands = list(cfg.bands_to_test)
+        else:
+            bands = sorted(df["band"].dropna().astype(str).unique())
+
+    bands = [b for b in bands if b in set(df["band"].astype(str))]
+    if len(bands) == 0:
+        return None
+
+    localities = list(localities)
+    effects = [e for e in effects if e in set(df["hist_effect"].astype(str))]
+    if len(effects) == 0:
+        return None
+
+    hist_range = (-1.0, 1.0)
+    edges = np.linspace(hist_range[0], hist_range[1], bins + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+
+    fig, axes = plt.subplots(
+        nrows=len(localities),
+        ncols=len(bands),
+        figsize=(3.8 * len(bands), 2.9 * len(localities)),
+        squeeze=False,
+        sharex=True,
+        sharey=False,
+    )
+
+    for r, loc in enumerate(localities):
+        for c, band in enumerate(bands):
+            ax = axes[r, c]
+
+            plotted_any = False
+            for effect in effects:
+                sub = df.loc[
+                    (df["band"].astype(str) == str(band))
+                    & (df["hist_locality"].astype(str) == str(loc))
+                    & (df["hist_effect"].astype(str) == str(effect))
+                ]
+
+                vals = sub[rho_col].to_numpy(float)
+                vals = vals[np.isfinite(vals)]
+
+                if len(vals) == 0:
+                    continue
+
+                y, _ = np.histogram(vals, bins=edges, density=density)
+
+                if smooth_sigma_bins is not None and smooth_sigma_bins > 0:
+                    y = gaussian_filter1d(y.astype(float), sigma=float(smooth_sigma_bins), mode="nearest")
+
+                label = f"{effect} (N={len(vals)})"
+                ax.plot(
+                    centers,
+                    y,
+                    linewidth=2.0,
+                    color=effect_colors.get(effect, None),
+                    label=label,
+                )
+                plotted_any = True
+
+            ax.axvline(0, linestyle=":", linewidth=1.0, color="black")
+            ax.set_xlim(hist_range)
+
+            if plotted_any:
+                ax.set_title(str(band), fontsize=9)
+                ax.legend(fontsize=7, frameon=False)
+            else:
+                ax.text(0.5, 0.5, "N=0", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(str(band), fontsize=9)
+
+            if c == 0:
+                ax.set_ylabel(f"{loc}\n{'density' if density else 'count'}")
+            if r == len(localities) - 1:
+                ax.set_xlabel("rho / r")
+
+    fig.suptitle(
+        f"{Path(out_file).stem} | signif {p_col}<{alpha} | {method}",
+        y=1.02,
+    )
+    fig.tight_layout()
+
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_file, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    return out_file
+
 
 def _available_general_effects(corr_df: pd.DataFrame) -> List[str]:
     """Effets principaux à tracer depuis group_label_x_locality."""
@@ -1304,7 +1591,7 @@ def _available_cog_subtypes(corr_df: pd.DataFrame) -> List[str]:
     if corr_df.empty or "corr_condition" not in corr_df.columns:
         return []
     sub = corr_df.loc[corr_df["corr_grouping"].astype(str) == "cog_subcategory_x_locality"].copy()
-    labels = []
+    labels = []f
     for cond in sub["corr_condition"].dropna().astype(str).unique():
         effect, loc = _condition_locality_from_corr_condition(cond)
         if loc in {"local", "distant"} and str(effect).startswith("cog::") and effect not in labels:
@@ -1359,6 +1646,8 @@ def plot_significant_histograms_suite(corr_df: pd.DataFrame,
 
     # 2) Effets principaux : cog+, negatif, contrôle si présent.
     for effect in _available_general_effects(corr_df):
+        if effect == 'unknown' : # parce qu'on s'en fiche, all_stims suffit deja
+            continue
         df_eff = _prepare_hist_df(
             corr_df,
             p_col=p_col,
@@ -1400,6 +1689,25 @@ def plot_significant_histograms_suite(corr_df: pd.DataFrame,
         if fp is not None:
             files.append(fp)
 
+    # 4) Effets principaux superposés : cog+ / controle / negatif.
+    fp = plot_effect_overlay_rho_hist_lines(
+        corr_df=corr_df,
+        out_file=out_dir / f"{safe_name(prefix)}_rho_hist_SIGNIF_effect_overlay_by_band_x_locality.png",
+        cfg=cfg,
+        bands=bands,
+        localities=("local", "distant"),
+        effects=("cog+", "controle", "negatif"),
+        effect_colors={
+            "cog+": "red",
+            "controle": "green",
+            "negatif": "blue",
+        },
+        smooth_sigma_bins=1.2,
+        density=True,
+    )
+    if fp is not None:
+        files.append(fp)
+
     return files
 
 
@@ -1422,7 +1730,9 @@ class PooledFRPowerCorrelationConfig:
     # Vérifie qu'un .nwb existe avant d'essayer la session.
     require_existing_nwb: bool = True
 
-    # Si True, ne relance pas une session dont le fichier correlations existe déjà.
+    # overwrite_session_outputs=False : réutilise les corrélations per-session déjà présentes.
+    overwrite_session_outputs: bool = True
+    # Ancien alias gardé pour compatibilité.
     skip_existing_session_outputs: bool = False
 
     # FDR recalculé après concaténation des lignes de corrélation de toutes les sessions.
@@ -1486,25 +1796,9 @@ def _root_with_trailing_sep(root: str | Path) -> str:
     return str(root).rstrip("/") + "/"
 
 
-def _default_get_nwb(patient: str, session: str, root_micro: str | Path) -> Any:
-    """Appelle functions_Rasters_DF.get_nwb si disponible."""
-    try:
-        from functions_Rasters_DF import get_nwb
-    except Exception as exc:
-        raise ImportError(
-            "Impossible d'importer get_nwb depuis functions_Rasters_DF. "
-            "Passe get_nwb_func=get_nwb à run_all_available_sessions_fr_power_correlations."
-        ) from exc
-    return get_nwb(patient, str(session), _root_with_trailing_sep(root_micro))
-
-
 def _load_common_bundle_for_session(session_dir: Path,
                                     hilbert_bands: Sequence[str]) -> CommonSessionBundle:
-    """Import dynamique pour rester compatible avec les noms/version de ton module common."""
-    try:
-        from spike_lfp_common_preprocess import load_common_session_bundle
-    except Exception:
-        from spike_lfp_common_preprocess_v3_savefix import load_common_session_bundle
+    """Recharge un common bundle avec les exports Hilbert demandés."""
     return load_common_session_bundle(
         session_dir,
         load_hilbert=True,
@@ -1588,7 +1882,6 @@ def pool_saved_session_correlations(session_output_dirs: Sequence[str | Path],
 
 
 def run_all_available_sessions_fr_power_correlations(pool_cfg: PooledFRPowerCorrelationConfig,
-                                                     get_nwb_func: Optional[Any] = None,
                                                      unit_metadata_func: Optional[Any] = None,
                                                      dead_intervals_func: Optional[Any] = None) -> Dict[str, Any]:
     """
@@ -1598,9 +1891,6 @@ def run_all_available_sessions_fr_power_correlations(pool_cfg: PooledFRPowerCorr
     ----------
     pool_cfg : PooledFRPowerCorrelationConfig
         Contient common_root, root_micro, output_root et session_cfg.
-    get_nwb_func : callable optionnel
-        Fonction compatible get_nwb(patient, session, root_micro). Si None, essaie
-        d'importer functions_Rasters_DF.get_nwb.
     unit_metadata_func : callable optionnel
         unit_metadata_func(patient, session, spikes) -> DataFrame avec colonne unit_id.
     dead_intervals_func : callable optionnel
@@ -1616,8 +1906,6 @@ def run_all_available_sessions_fr_power_correlations(pool_cfg: PooledFRPowerCorr
     if len(common_dirs) == 0:
         raise RuntimeError(f"Aucun common bundle trouvé dans {pool_cfg.common_root}")
 
-    get_nwb_func = get_nwb_func or _default_get_nwb
-
     session_output_dirs: List[Path] = []
     rows_summary: List[Dict[str, Any]] = []
     errors: List[Tuple[str, str]] = []
@@ -1631,39 +1919,57 @@ def run_all_available_sessions_fr_power_correlations(pool_cfg: PooledFRPowerCorr
             skipped.append((session_name, f"parse_session_name_failed: {exc}"))
             continue
 
-        nwb_fp = find_nwb_file(pool_cfg.root_micro, patient, session)
-        if pool_cfg.require_existing_nwb and nwb_fp is None:
-            skipped.append((session_name, "NWB absent"))
-            continue
-
         out_session_dir = session_out_root / session_name
         corr_fp = _csv_path(out_session_dir, f"{session_name}_fr_power_correlations", cfg.compression)
-        if pool_cfg.skip_existing_session_outputs and corr_fp.exists():
+        reuse_existing = (pool_cfg.skip_existing_session_outputs or not pool_cfg.overwrite_session_outputs) and corr_fp.exists()
+        if reuse_existing:
             session_output_dirs.append(out_session_dir)
             rows_summary.append({
                 "session": session_name,
                 "patient": patient,
                 "session_num": session,
-                "status": "skipped_existing",
-                "nwb_file": str(nwb_fp) if nwb_fp is not None else None,
+                "status": "reused_existing",
+                "nwb_file": None,
                 "out_dir": str(out_session_dir),
             })
+            continue
+
+        nwb_fp = find_nwb_file(pool_cfg.root_micro, patient, session)
+        if pool_cfg.require_existing_nwb and nwb_fp is None:
+            skipped.append((session_name, "NWB absent"))
+            rows_summary.append({"session": session_name, "patient": patient, "session_num": session, "status": "skipped_nwb_absent"})
             continue
 
         try:
             log(f"\n=== FR-power multi-session | {session_name} ===", pool_cfg.verbose)
             bundle = _load_common_bundle_for_session(session_dir, pool_cfg.hilbert_bands)
-            spikes = get_nwb_func(patient, str(session), _root_with_trailing_sep(pool_cfg.root_micro))
+            spikes = get_nwb(patient, str(session), _root_with_trailing_sep(pool_cfg.root_micro))
             units = make_units_dict_from_spikes_object(spikes)
 
-            unit_metadata = unit_metadata_func(patient, str(session), spikes) if unit_metadata_func is not None else None
-            dead_intervals_by_unit = dead_intervals_func(patient, str(session), spikes) if dead_intervals_func is not None else None
+            if unit_metadata_func is not None:
+                unit_metadata = unit_metadata_func(patient, str(session), spikes)
+            elif cfg.use_deadfiles:
+                unit_metadata = build_unit_metadata_from_spikes(patient, str(session), pool_cfg.root_micro, spikes)
+            else:
+                unit_metadata = None
 
+            if dead_intervals_func is not None:
+                dead_intervals_by_unit = dead_intervals_func(patient, str(session), spikes)
+            elif cfg.use_deadfiles:
+                dead_intervals_by_unit = build_dead_intervals_by_unit(patient, str(session), pool_cfg.root_micro, spikes)
+            else:
+                dead_intervals_by_unit = None
+
+            cfg_session = replace(
+                cfg,
+                overwrite=pool_cfg.overwrite_session_outputs,
+                reuse_existing_if_available=(pool_cfg.skip_existing_session_outputs or not pool_cfg.overwrite_session_outputs),
+            )
             out = run_session_fr_power_correlations(
                 bundle=bundle,
                 units=units,
                 out_dir=session_out_root,
-                cfg=cfg,
+                cfg=cfg_session,
                 dead_intervals_by_unit=dead_intervals_by_unit,
                 unit_metadata=unit_metadata,
             )
@@ -1701,10 +2007,10 @@ def run_all_available_sessions_fr_power_correlations(pool_cfg: PooledFRPowerCorr
         "errors": errors,
         "pooled_summary": pool_result.get("summary", {}),
     }
-    with open(output_root / "run_all_fr_power_correlations_summary.json", "w", encoding="utf-8") as f:
+    with open(pooled_out / "run_all_fr_power_correlations_summary.json", "w", encoding="utf-8") as f:
         json.dump(_jsonify(run_summary), f, ensure_ascii=False, indent=2)
 
-    pd.DataFrame(rows_summary).to_csv(output_root / "run_all_fr_power_correlations_sessions.csv", index=False)
+    pd.DataFrame(rows_summary).to_csv(pooled_out / "run_all_fr_power_correlations_sessions.csv", index=False)
 
     return {
         "session_summary": pd.DataFrame(rows_summary),
@@ -1715,6 +2021,169 @@ def run_all_available_sessions_fr_power_correlations(pool_cfg: PooledFRPowerCorr
     }
 
 
+# =============================================================================
+# VARIANTES INDÉPENDANTES FR × LFP
+# =============================================================================
+
+
+def metric_variant_subdir(fr_norm_method: str, lfp_value_col: str) -> str:
+    """Nom de sous-dossier stable pour une variante d'analyse."""
+    return f"fr_{safe_name(fr_norm_method)}__lfp_{safe_name(lfp_value_col.replace('lfp_power_', ''))}"
+
+
+def run_session_fr_power_correlation_variants(bundle: CommonSessionBundle,
+                                              units: Dict[Any, Any],
+                                              out_dir: str | Path,
+                                              base_cfg: Optional[FRPowerCorrelationConfig] = None,
+                                              fr_norm_methods: Tuple[FRNormMethod, ...] = ("logratio",),
+                                              lfp_value_cols: Tuple[LFPValueColumn, ...] = ("lfp_power_pre_logratio",),
+                                              correlation_methods: Optional[Tuple[CorrelationMethod, ...]] = None,
+                                              dead_intervals_by_unit: Optional[Dict[Any, Any]] = None,
+                                              unit_metadata: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    """Lance plusieurs variantes indépendantes pour une session.
+
+    Hiérarchie créée :
+        out_dir / fr_<méthode_FR>__lfp_<métrique_LFP> / SESSION / ...
+
+    Cela évite de mélanger des résultats issus de normalisations différentes.
+    """
+    base_cfg = base_cfg or FRPowerCorrelationConfig()
+    root = ensure_dir(out_dir)
+    rows = []
+    results: Dict[str, Any] = {}
+
+    for fr_method in fr_norm_methods:
+        for lfp_col in lfp_value_cols:
+            cfg = replace(base_cfg, fr_norm_method=fr_method, lfp_value_col=lfp_col)
+            if correlation_methods is not None:
+                cfg = replace(cfg, correlation_methods=correlation_methods)
+            variant = metric_variant_subdir(fr_method, lfp_col)
+            variant_root = ensure_dir(root / variant)
+            try:
+                out = run_session_fr_power_correlations(
+                    bundle=bundle,
+                    units=units,
+                    out_dir=variant_root,
+                    cfg=cfg,
+                    dead_intervals_by_unit=dead_intervals_by_unit,
+                    unit_metadata=unit_metadata,
+                )
+                results[variant] = out
+                rows.append({
+                    "variant": variant,
+                    "fr_norm_method": fr_method,
+                    "lfp_value_col": lfp_col,
+                    "status": "ok",
+                    "session_out": str(out.get("session_out")),
+                    "n_correlation_rows": int(out.get("summary", {}).get("n_correlation_rows", 0)),
+                    "n_significant_rows": int(out.get("summary", {}).get("n_significant_rows", 0)),
+                })
+            except Exception as exc:
+                rows.append({
+                    "variant": variant,
+                    "fr_norm_method": fr_method,
+                    "lfp_value_col": lfp_col,
+                    "status": "error",
+                    "error": repr(exc),
+                })
+
+    summary_df = pd.DataFrame(rows)
+    summary_fp = root / f"{bundle.session_name}_fr_power_variant_summary.csv"
+    summary_df.to_csv(summary_fp, index=False)
+    return {"results": results, "summary": summary_df, "summary_file": summary_fp, "out_dir": root}
+
+
+@dataclass
+class PooledFRPowerCorrelationVariantsConfig:
+    """Configuration multi-sessions × variantes métriques."""
+
+    common_root: str
+    root_micro: str
+    output_root: str
+    hilbert_bands: Tuple[str, ...] = ("theta", "alpha", "beta", "low_gamma", "high_gamma")
+    base_session_cfg: FRPowerCorrelationConfig = field(default_factory=FRPowerCorrelationConfig)
+    fr_norm_methods: Tuple[FRNormMethod, ...] = ("logratio",)
+    lfp_value_cols: Tuple[LFPValueColumn, ...] = ("lfp_power_pre_logratio",)
+    correlation_methods: Optional[Tuple[CorrelationMethod, ...]] = None
+    require_existing_nwb: bool = True
+    overwrite_session_outputs: bool = True
+    skip_existing_session_outputs: bool = False
+    recompute_pooled_fdr: bool = True
+    verbose: bool = True
+
+
+def run_all_available_sessions_fr_power_correlation_variants(pool_cfg: PooledFRPowerCorrelationVariantsConfig,
+                                                             unit_metadata_func: Optional[Any] = None,
+                                                             dead_intervals_func: Optional[Any] = None) -> Dict[str, Any]:
+    """Lance le pipeline multi-sessions pour plusieurs variantes indépendantes.
+
+    Hiérarchie :
+        output_root/
+            fr_logratio__lfp_pre_logratio/
+                per_session/...
+                pooled_across_sessions/...
+            fr_zscore__lfp_pre_zscore/
+                ...
+    """
+    output_root = ensure_dir(pool_cfg.output_root)
+    rows = []
+    results: Dict[str, Any] = {}
+
+    for fr_method in pool_cfg.fr_norm_methods:
+        for lfp_col in pool_cfg.lfp_value_cols:
+            cfg = replace(pool_cfg.base_session_cfg, fr_norm_method=fr_method, lfp_value_col=lfp_col)
+            if pool_cfg.correlation_methods is not None:
+                cfg = replace(cfg, correlation_methods=pool_cfg.correlation_methods)
+            variant = metric_variant_subdir(fr_method, lfp_col)
+            variant_root = ensure_dir(output_root / variant)
+            sub_pool_cfg = PooledFRPowerCorrelationConfig(
+                common_root=pool_cfg.common_root,
+                root_micro=pool_cfg.root_micro,
+                output_root=str(variant_root),
+                hilbert_bands=pool_cfg.hilbert_bands,
+                session_cfg=cfg,
+                require_existing_nwb=pool_cfg.require_existing_nwb,
+                overwrite_session_outputs=pool_cfg.overwrite_session_outputs,
+                skip_existing_session_outputs=pool_cfg.skip_existing_session_outputs,
+                recompute_pooled_fdr=pool_cfg.recompute_pooled_fdr,
+                make_pooled_histograms=cfg.make_significant_histograms,
+                verbose=pool_cfg.verbose,
+            )
+            try:
+                out = run_all_available_sessions_fr_power_correlations(
+                    pool_cfg=sub_pool_cfg,
+                    unit_metadata_func=unit_metadata_func,
+                    dead_intervals_func=dead_intervals_func,
+                )
+                results[variant] = out
+                rows.append({
+                    "variant": variant,
+                    "fr_norm_method": fr_method,
+                    "lfp_value_col": lfp_col,
+                    "status": "ok",
+                    "output_root": str(variant_root),
+                    "n_session_rows": int(len(out.get("session_summary", []))),
+                    "n_pooled_rows": int(len(out.get("pooled", []))),
+                    "n_pooled_significant_rows": int(len(out.get("pooled_significant", []))),
+                })
+            except Exception as exc:
+                rows.append({
+                    "variant": variant,
+                    "fr_norm_method": fr_method,
+                    "lfp_value_col": lfp_col,
+                    "status": "error",
+                    "error": repr(exc),
+                    "output_root": str(variant_root),
+                })
+
+    summary_df = pd.DataFrame(rows)
+    summary_fp = output_root / "run_all_fr_power_variants_summary.csv"
+    summary_df.to_csv(summary_fp, index=False)
+    with open(output_root / "run_all_fr_power_variants_summary.json", "w", encoding="utf-8") as f:
+        json.dump(_jsonify({"rows": rows}), f, ensure_ascii=False, indent=2)
+    return {"results": results, "summary": summary_df, "summary_file": summary_fp, "output_root": output_root}
+
+
 __all__ = [
     "FRPowerCorrelationConfig",
     "make_relative_bin_table",
@@ -1723,8 +2192,11 @@ __all__ = [
     "build_lfp_power_bin_table_for_band",
     "build_fr_power_trial_bin_table",
     "compute_correlations_from_trial_bin_table",
+    "existing_session_corr_outputs",
+    "load_existing_session_fr_power_result",
     "run_session_fr_power_correlations",
     "make_units_dict_from_spikes_object",
+    "prepare_unit_metadata_and_dead_intervals",
     "PooledFRPowerCorrelationConfig",
     "find_common_session_dirs",
     "find_nwb_file",
@@ -1732,4 +2204,8 @@ __all__ = [
     "pool_saved_session_correlations",
     "get_significant_correlations",
     "plot_significant_histograms_suite",
+    "metric_variant_subdir",
+    "run_session_fr_power_correlation_variants",
+    "PooledFRPowerCorrelationVariantsConfig",
+    "run_all_available_sessions_fr_power_correlation_variants",
 ]

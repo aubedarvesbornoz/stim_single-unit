@@ -436,7 +436,7 @@ def parse_stim_label_metadata(stim_label) -> Dict[str, Optional[str]]:
     return out
 
 
-def add_stim_metadata_to_trials(stims_df: pd.DataFrame) -> pd.DataFrame:
+def add_stim_metadata_to_stims(stims_df: pd.DataFrame) -> pd.DataFrame:
     """
     Ajoute à la stims_table les colonnes dérivées du label de stimulation.
     """
@@ -850,7 +850,7 @@ def merge_event_tables(session: str, cog_df: pd.DataFrame, trc_corr_df: pd.DataF
     if bad_rows.any():
         raise ValueError(f"{session}: t_start/duration NaN dans certaines lignes après fusion")
 
-    merged = add_stim_metadata_to_trials(merged) # ajout infos stims
+    merged = add_stim_metadata_to_stims(merged) # ajout infos stims
 
     return merged
 
@@ -1078,7 +1078,7 @@ def make_bipolar_data(
 # WINDOWING AND EPOCHING
 # ============================================================================
 
-def compute_trial_windows(row: pd.Series, pre_length: float, post_length: float, epsilon: float) -> Dict[str, float]:
+def compute_stim_windows(row: pd.Series, pre_length: float, post_length: float, epsilon: float) -> Dict[str, float]:
     """
     Calcule les fenêtres temporelles pré- et post-stimulation pour une ligne d'essai.
 
@@ -1124,7 +1124,7 @@ def compute_trial_windows(row: pd.Series, pre_length: float, post_length: float,
 
 
 
-def add_windows_to_trials(stims_df: pd.DataFrame, pre_length: float, post_length: float, epsilon: float) -> pd.DataFrame:
+def add_windows_to_stims(stims_df: pd.DataFrame, pre_length: float, post_length: float, epsilon: float) -> pd.DataFrame:
     """
     Ajoute les bornes des fenêtres pré/post à la table d'essais.
 
@@ -1145,13 +1145,13 @@ def add_windows_to_trials(stims_df: pd.DataFrame, pre_length: float, post_length
         Copie de la table d'origine enrichie des colonnes de fenêtres.
     """
     out = stims_df.copy()
-    windows = out.apply(compute_trial_windows, axis=1, pre_length=pre_length, post_length=post_length, epsilon=epsilon)
+    windows = out.apply(compute_stim_windows, axis=1, pre_length=pre_length, post_length=post_length, epsilon=epsilon)
     wdf = pd.DataFrame(list(windows))
     return pd.concat([out.reset_index(drop=True), wdf.reset_index(drop=True)], axis=1)
 
 
 
-def keep_trials_fitting_signal(stims_df: pd.DataFrame, signal_duration_s: float, verbose: bool = True) -> pd.DataFrame:
+def keep_stims_fitting_signal(stims_df: pd.DataFrame, signal_duration_s: float, verbose: bool = True) -> pd.DataFrame:
     """
     Exclut les essais dont les fenêtres pré ou post débordent du signal disponible.
 
@@ -1203,8 +1203,8 @@ def extract_pre_post_epochs(
     Retour
     ------
     Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-        - pre_epochs  : (n_trials, n_channels, n_pre_samples)
-        - post_epochs : (n_trials, n_channels, n_post_samples)
+        - pre_epochs  : (n_stims, n_channels, n_pre_samples)
+        - post_epochs : (n_stims, n_channels, n_post_samples)
         - pre_times   : axe temps relatif pré, en secondes
         - post_times  : axe temps relatif post, en secondes
 
@@ -1300,7 +1300,7 @@ __all__ = [
     "parse_bipolar_shaft",
     "group_bipolar_channels_by_shaft",
     "parse_stim_label_metadata",
-    "add_stim_metadata_to_trials",
+    "add_stim_metadata_to_stims",
     "classify_group_and_cog_labels",
 
     # Entrées / chargements
@@ -1325,9 +1325,9 @@ __all__ = [
     "make_bipolar_data",
 
     # Epoching
-    "compute_trial_windows",
-    "add_windows_to_trials",
-    "keep_trials_fitting_signal",
+    "compute_stim_windows",
+    "add_windows_to_stims",
+    "keep_stims_fitting_signal",
     "extract_pre_post_epochs",
     "build_global_baseline_segment",
 

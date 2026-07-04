@@ -12,7 +12,7 @@ Philosophie
 Ce module reprend la logique statistique développée pour les résultats Morlet,
 mais l'applique à des séries temporelles Hilbert déjà agrégées par bandes.
 
-L'unité d'observation reste un couple (session, trial, channel). Les observations
+L'unité d'observation reste un couple (session, stim, channel). Les observations
 peuvent être regroupées :
 - par condition principale (`cog+`, `controle`, `negatif`) ;
 - par sous-catégories cognitives (`cog::souvenir`, etc.) ;
@@ -53,8 +53,6 @@ from lfp_morlet_stats import (
 )
 
 from lfp_hilbert_utils import (
-    # HilbertConfig,
-    # load_hilbert_session_exports,
     load_hilbert_band_epochs,
 )
 
@@ -82,7 +80,7 @@ class HilbertStatsConfig:
     tail: int = 0
     seed: int = 13
 
-    min_trials_per_condition: int = 5
+    min_stims_per_condition: int = 5
     make_main_groups: bool = True
     make_cog_subgroups: bool = True
     keep_main_groups_in_subgroup_mode: bool = True
@@ -110,8 +108,8 @@ def load_hilbert_session_metadata(session_dir: Path, session: str) -> dict:
 
 
 
-def load_hilbert_trials_table(session_dir: Path, session: str) -> pd.DataFrame:
-    fp = session_dir / f"{session}_trial_table.csv"
+def load_hilbert_stims_table(session_dir: Path, session: str) -> pd.DataFrame:
+    fp = session_dir / f"{session}_stim_table.csv"
     if not fp.exists():
         raise FileNotFoundError(fp)
     return pd.read_csv(fp)
@@ -128,9 +126,9 @@ def load_hilbert_times(session_dir: Path, session: str) -> np.ndarray:
 
 def stack_hilbert_band_condition_locality(session: str,
                                           session_dir: Path,
-                                          trials_df: pd.DataFrame,
+                                          stims_df: pd.DataFrame,
                                           bp_names: Sequence[str],
-                                          trial_indices: np.ndarray,
+                                          stim_indices: np.ndarray,
                                           locality: str,
                                           band_name: str,
                                           condition_name: Optional[str] = None
@@ -147,11 +145,11 @@ def stack_hilbert_band_condition_locality(session: str,
         raise ValueError(f"locality doit être 'local' ou 'distant', reçu: {locality}")
 
     arr = load_hilbert_band_epochs(session_dir=session_dir, session=session, band_name=band_name)
-    # arr shape = (n_trials, n_channels, n_times)
+    # arr shape = (n_stims, n_channels, n_times)
     if arr.ndim != 3:
         raise ValueError(f"{session} {band_name}: shape inattendue {arr.shape}")
 
-    trial_indices = np.asarray(np.unique(trial_indices), dtype=int)
+    stim_indices = np.asarray(np.unique(stim_indices), dtype=int)
     stacks: List[np.ndarray] = []
     rows: List[dict] = []
 
@@ -161,28 +159,28 @@ def stack_hilbert_band_condition_locality(session: str,
         channel_shaft = parse_bipolar_shaft(ch_name)
 
         selected_rows = []
-        for trial_idx in trial_indices:
-            if trial_idx >= len(trials_df):
+        for stim_idx in stim_indices:
+            if stim_idx >= len(stims_df):
                 continue
-            if trial_idx >= arr.shape[0]:
+            if stim_idx >= arr.shape[0]:
                 continue
 
-            stim_shaft = trials_df.loc[trial_idx, "stim_shaft"]
+            stim_shaft = stims_df.loc[stim_idx, "stim_shaft"]
             obs_locality = get_channel_locality_for_trial(ch_name, stim_shaft)
             if obs_locality == "unknown" or obs_locality != locality:
                 continue
 
-            selected_rows.append(trial_idx)
+            selected_rows.append(stim_idx)
             rows.append({
                 "session": session,
                 "condition": condition_name,
-                "trial_idx": int(trial_idx),
+                "stim_idx": int(stim_idx),
                 "channel_name": ch_name,
                 "channel_shaft": channel_shaft,
                 "stim_shaft": stim_shaft,
-                "label_stim": trials_df.loc[trial_idx, "label_stim"],
-                "group_label": trials_df.loc[trial_idx, "group_label"],
-                "cog_labels": trials_df.loc[trial_idx, "cog_labels"] if "cog_labels" in trials_df.columns else None,
+                "label_stim": stims_df.loc[stim_idx, "label_stim"],
+                "group_label": stims_df.loc[stim_idx, "group_label"],
+                "cog_labels": stims_df.loc[stim_idx, "cog_labels"] if "cog_labels" in stims_df.columns else None,
                 "locality": locality,
                 "band_name": band_name,
             })
@@ -231,31 +229,31 @@ def stack_hilbert_band_condition_locality_across_sessions(session_dirs: Sequence
 
     for session_dir in session_dirs:
         session = session_dir.name
-        trials_df = load_hilbert_trials_table(session_dir, session)
+        stims_df = load_hilbert_stims_table(session_dir, session)
         meta = load_hilbert_session_metadata(session_dir, session)
         bp_names = meta.get("bipolar_names", [])
         if len(bp_names) == 0:
             continue
-        if "stim_shaft" not in trials_df.columns:
+        if "stim_shaft" not in stims_df.columns:
             raise ValueError(f"{session}: colonne 'stim_shaft' absente, il faut régénérer les exports Hilbert")
 
         if subgroup_mode:
-            cond_index = build_cog_subcategory_index(trials_df, cfg.min_trials_per_condition, cfg.keep_main_groups_in_subgroup_mode)
+            cond_index = build_cog_subcategory_index(stims_df, cfg.min_stims_per_condition, cfg.keep_main_groups_in_subgroup_mode)
         else:
-            cond_index = build_main_condition_index(trials_df,cfg.min_trials_per_condition)
+            cond_index = build_main_condition_index(stims_df,cfg.min_stims_per_condition)
 
         if condition_name not in cond_index:
             continue
 
-        trial_indices = cond_index[condition_name]
+        stim_indices = cond_index[condition_name]
 
         try:
             X_session, obs_session = stack_hilbert_band_condition_locality(
                 session=session,
                 session_dir=session_dir,
-                trials_df=trials_df,
+                stims_df=stims_df,
                 bp_names=bp_names,
-                trial_indices=trial_indices,
+                stim_indices=stim_indices,
                 locality=locality,
                 band_name=band_name,
                 condition_name=condition_name,
@@ -465,7 +463,7 @@ def run_stats_for_one_hilbert_condition(out_condition_dir: Path,
         "band_name": band_name,
         "n_observations": int(X.shape[0]),
         "n_times": int(X.shape[1]),
-        "n_unique_trials": int(obs_df[["session", "trial_idx"]].drop_duplicates().shape[0]) if "session" in obs_df.columns else int(obs_df["trial_idx"].nunique()),
+        "n_unique_stims": int(obs_df[["session", "stim_idx"]].drop_duplicates().shape[0]) if "session" in obs_df.columns else int(obs_df["stim_idx"].nunique()),
         "n_unique_channels": int(obs_df[["session", "channel_name"]].drop_duplicates().shape[0]) if "session" in obs_df.columns else int(obs_df["channel_name"].nunique()),
         "n_unique_sessions": int(obs_df["session"].nunique()) if "session" in obs_df.columns else 1,
     }
@@ -537,7 +535,7 @@ def run_hilbert_session_condition_stats(session_dir: Path, cfg: HilbertStatsConf
     ensure_dir(out_session_root)
     save_hilbert_stats_config(out_session_root, cfg)
 
-    trials_df = load_hilbert_trials_table(session_dir, session)
+    stims_df = load_hilbert_stims_table(session_dir, session)
     meta = load_hilbert_session_metadata(session_dir, session)
     times = load_hilbert_times(session_dir, session)
     bp_names = meta.get("bipolar_names", [])
@@ -548,7 +546,7 @@ def run_hilbert_session_condition_stats(session_dir: Path, cfg: HilbertStatsConf
 
     def _run_group_block(cond_index: Dict[str, np.ndarray], root_out: Path, scope_label: str):
         ensure_dir(root_out)
-        for condition_name, trial_indices in cond_index.items():
+        for condition_name, stim_indices in cond_index.items():
             cond_out = root_out / safe_name(condition_name)
             ensure_dir(cond_out)
             for locality in cfg.localities_to_test:
@@ -557,9 +555,9 @@ def run_hilbert_session_condition_stats(session_dir: Path, cfg: HilbertStatsConf
                         X, obs_df = stack_hilbert_band_condition_locality(
                             session=session,
                             session_dir=session_dir,
-                            trials_df=trials_df,
+                            stims_df=stims_df,
                             bp_names=bp_names,
-                            trial_indices=trial_indices,
+                            stim_indices=stim_indices,
                             locality=locality,
                             band_name=band_name,
                             condition_name=condition_name,
@@ -581,11 +579,11 @@ def run_hilbert_session_condition_stats(session_dir: Path, cfg: HilbertStatsConf
                         log(f"[WARN] {session} {condition_name} {locality} {band_name}: {exc}", cfg.verbose)
 
     if cfg.make_main_groups:
-        cond_index_main = build_main_condition_index(trials_df, cfg.min_trials_per_condition)
+        cond_index_main = build_main_condition_index(stims_df, cfg.min_stims_per_condition)
         _run_group_block(cond_index_main, out_session_root / "condition_main", scope_label="per_session")
 
     if cfg.make_cog_subgroups:
-        cond_index_sub = build_cog_subcategory_index(trials_df, cfg.min_trials_per_condition, cfg.keep_main_groups_in_subgroup_mode)
+        cond_index_sub = build_cog_subcategory_index(stims_df, cfg.min_stims_per_condition, cfg.keep_main_groups_in_subgroup_mode)
         _run_group_block(cond_index_sub, out_session_root / "condition_subcategories", scope_label="per_session")
 
     if summary_rows:
@@ -612,11 +610,11 @@ def run_pooled_hilbert_condition_stats(cfg: HilbertStatsConfig) -> Path:
         names = set()
         for session_dir in session_dirs:
             session = session_dir.name
-            trials_df = load_hilbert_trials_table(session_dir, session)
+            stims_df = load_hilbert_stims_table(session_dir, session)
             if subgroup_mode:
-                cond_index = build_cog_subcategory_index(trials_df, cfg.min_trials_per_condition, cfg.keep_main_groups_in_subgroup_mode)
+                cond_index = build_cog_subcategory_index(stims_df, cfg.min_stims_per_condition, cfg.keep_main_groups_in_subgroup_mode)
             else:
-                cond_index = build_main_condition_index(trials_df, cfg.min_trials_per_condition)
+                cond_index = build_main_condition_index(stims_df, cfg.min_stims_per_condition)
             names.update(cond_index.keys())
         return sorted(names)
 
@@ -695,7 +693,7 @@ def run_all_hilbert_stats(cfg: HilbertStatsConfig) -> Dict[str, Any]:
 __all__ = [
     "HilbertStatsConfig",
     "load_hilbert_session_metadata",
-    "load_hilbert_trials_table",
+    "load_hilbert_stims_table",
     "load_hilbert_times",
     "stack_hilbert_band_condition_locality",
     "validate_same_hilbert_time_grid_across_sessions",

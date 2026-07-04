@@ -63,7 +63,6 @@ from lfp_preprocess_utils import (
     read_stim_events,
     recover_precise_macro_stim_events,
     find_cog_file,
-    # find_duration_file,
     read_cog_file,
     merge_event_tables,
     load_bad_channels_table,
@@ -72,8 +71,8 @@ from lfp_preprocess_utils import (
     apply_filters,
     build_adjacent_bipolar_pairs,
     make_bipolar_data,
-    add_windows_to_trials,
-    keep_trials_fitting_signal,
+    add_windows_to_stims,
+    keep_stims_fitting_signal,
 )
 
 
@@ -392,7 +391,7 @@ def extract_epochs_from_continuous_feature(feature_data: np.ndarray,
 
     Retour
     ------
-    epochs : shape = (n_trials, n_channels, n_pre + n_post)
+    epochs : shape = (n_stims, n_channels, n_pre + n_post)
     times  : shape = (n_pre + n_post,)
     keep_indices : indices des essais effectivement extraits
     """
@@ -442,7 +441,7 @@ def decimate_times(times: np.ndarray, decim: int) -> np.ndarray:
 def decimate_feature_epochs(epochs: np.ndarray, decim: int) -> np.ndarray:
     """
     Décime uniquement les époques Hilbert.
-    epochs shape = (n_trials, n_channels, n_times)
+    epochs shape = (n_stims, n_channels, n_times)
     """
     if decim <= 1:
         return epochs.astype(np.float32)
@@ -479,13 +478,13 @@ def save_hilbert_session_metadata(session_out: Path,
                                   raw_ch_names: Sequence[str],
                                   bad_channels: Sequence[str],
                                   bp_names: Sequence[str]) -> None:
-    """Sauvegarde la trial table et les métadonnées de session Hilbert."""
+    """Sauvegarde la stim table et les métadonnées de session Hilbert."""
     ensure_dir(session_out)
-    stims_df.to_csv(session_out / f"{session}_trial_table.csv", index=False)
+    stims_df.to_csv(session_out / f"{session}_stim_table.csv", index=False)
     meta = {
         "session": session,
         "config": asdict(cfg),
-        "n_trials": int(len(stims_df)),
+        "n_stims": int(len(stims_df)),
         "n_raw_channels": int(len(raw_ch_names)),
         "n_bad_channels": int(len(bad_channels)),
         "n_bipolar_channels": int(len(bp_names)),
@@ -515,13 +514,13 @@ def load_hilbert_session_exports(session_dir: Path, session: Optional[str] = Non
     """Recharge les exports de base d'une session Hilbert."""
     session_name = session or session_dir.name
     meta_file = session_dir / f"{session_name}_metadata.json"
-    trials_file = session_dir / f"{session_name}_trial_table.csv"
+    stims_file = session_dir / f"{session_name}_stim_table.csv"
     times_file = session_dir / f"{session_name}_times.npy"
 
     if not meta_file.exists():
         raise FileNotFoundError(meta_file)
-    if not trials_file.exists():
-        raise FileNotFoundError(trials_file)
+    if not stims_file.exists():
+        raise FileNotFoundError(stims_file)
     if not times_file.exists():
         raise FileNotFoundError(times_file)
 
@@ -531,7 +530,7 @@ def load_hilbert_session_exports(session_dir: Path, session: Optional[str] = Non
     return {
         "session": session_name,
         "metadata": metadata,
-        "stims_df": pd.read_csv(trials_file),
+        "stims_df": pd.read_csv(stims_file),
         "times": np.load(times_file),
     }
 
@@ -558,7 +557,7 @@ def prepare_hilbert_session_data(session: str,
                                  root_dir: Path,
                                  bad_df: pd.DataFrame,
                                  cfg: HilbertConfig) -> Dict[str, Any]:
-    """Prépare les signaux bipolaires continus et la trial table pour une session."""
+    """Prépare les signaux bipolaires continus et la stim table pour une session."""
     verbose = cfg.verbose
     log(f"\n=== Préparation Hilbert session {session} ===", verbose)
 
@@ -574,7 +573,7 @@ def prepare_hilbert_session_data(session: str,
         trc_corr_df = recover_precise_macro_stim_events(session, root_dir)
 
     stims_df = merge_event_tables(session, cog_df, trc_corr_df)
-    stims_df = add_windows_to_trials(stims_df, pre_length=cfg.pre_length, post_length=cfg.post_length, epsilon=cfg.epsilon)
+    stims_df = add_windows_to_stims(stims_df, pre_length=cfg.pre_length, post_length=cfg.post_length, epsilon=cfg.epsilon)
 
     raw = load_trc_as_mne_raw(trc_path, verbose=verbose)
     sfreq = float(raw.info["sfreq"])
@@ -582,7 +581,7 @@ def prepare_hilbert_session_data(session: str,
     raw_data = raw.get_data()
     signal_duration_s = raw_data.shape[1] / sfreq
 
-    stims_df = keep_trials_fitting_signal(stims_df, signal_duration_s, verbose=verbose)
+    stims_df = keep_stims_fitting_signal(stims_df, signal_duration_s, verbose=verbose)
     if len(stims_df) == 0:
         raise RuntimeError(f"{session}: aucun essai exploitable après contrôle des fenêtres")
 

@@ -261,7 +261,7 @@ def load_session_metadata(session_dir: Path, session: str) -> dict:
         return json.load(f)
 
 
-def load_trials_table(session_dir: Path, session: str) -> pd.DataFrame:
+def load_stims_table(session_dir: Path, session: str) -> pd.DataFrame:
     fp = session_dir / f"{session}_stims_table.csv"
     if not fp.exists():
         raise FileNotFoundError(fp)
@@ -844,7 +844,7 @@ def run_stats_for_one_condition(session: str,
 
       X shape = (n_observations, n_freqs, n_times)
 
-    où chaque observation correspond à un couple (trial, channel).
+    où chaque observation correspond à un couple (stim, channel).
 
     Paramètres
     ----------
@@ -860,7 +860,7 @@ def run_stats_for_one_condition(session: str,
         Tenseur empilé des observations, shape = (n_observations, n_freqs, n_times).
     obs_df : pd.DataFrame
         Table décrivant chaque observation incluse dans X.
-        Une ligne = une observation = un couple (trial, channel).
+        Une ligne = une observation = un couple (stim, channel).
     freqs : np.ndarray
         Axe fréquentiel.
     times : np.ndarray
@@ -897,7 +897,7 @@ def run_stats_for_one_condition(session: str,
         "locality": locality,
         "metric": cfg.metric,
         "n_observations": int(n_obs),
-        "n_unique_trials": int(obs_df["trial_idx"].nunique()) if "trial_idx" in obs_df.columns else np.nan,
+        "n_unique_stims": int(obs_df["stim_idx"].nunique()) if "stim_idx" in obs_df.columns else np.nan,
         "n_unique_channels": int(obs_df["channel_name"].nunique()) if "channel_name" in obs_df.columns else np.nan,
         "n_freqs": int(X.shape[1]),
         "n_times": int(X.shape[2]),
@@ -1010,7 +1010,7 @@ def run_stats_for_one_condition_across_sessions(out_condition_dir: Path,
         "locality": locality,
         "metric": cfg.metric,
         "n_observations": int(n_obs),
-        "n_unique_trials": int(obs_df[["session", "trial_idx"]].drop_duplicates().shape[0]),
+        "n_unique_stims": int(obs_df[["session", "stim_idx"]].drop_duplicates().shape[0]),
         "n_unique_channels": int(obs_df[["session", "channel_name"]].drop_duplicates().shape[0]),
         "n_unique_sessions": int(obs_df["session"].nunique()),
         "n_freqs": int(X.shape[1]),
@@ -1258,9 +1258,9 @@ def run_session_condition_stats(session_dir: Path, cfg: StatsConfig) -> Path:
 
     Pour chaque condition (cog+, controle, negatif, ou sous-catégorie cog),
     on construit deux regroupements :
-      - local   : toutes les observations (trial, channel) dont le shaft du canal
+      - local   : toutes les observations (stim, channel) dont le shaft du canal
                   est le même que le shaft stimulé
-      - distant : toutes les observations (trial, channel) dont le shaft du canal
+      - distant : toutes les observations (stim, channel) dont le shaft du canal
                   est différent du shaft stimulé
 
     Les statistiques sont ensuite réalisées sur ces tenseurs empilés.
@@ -1273,7 +1273,7 @@ def run_session_condition_stats(session_dir: Path, cfg: StatsConfig) -> Path:
     save_stats_config(out_session_root, cfg)
 
 
-    stims_df = load_trials_table(session_dir, session)
+    stims_df = load_stims_table(session_dir, session)
     meta = load_session_metadata(session_dir, session)
     freqs, post_times = load_freqs_times(session_dir, session)
 
@@ -1913,7 +1913,7 @@ __all__ = [
     "fdr_bh",
     "compute_metric_from_raw",
     "load_session_metadata",
-    "load_trials_table",
+    "load_stims_table",
     "load_freqs_times",
     "load_metric_or_compute",
     "wilcoxon_map_against_zero",

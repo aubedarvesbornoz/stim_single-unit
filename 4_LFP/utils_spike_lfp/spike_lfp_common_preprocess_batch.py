@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-spike_lfp_common_batch.py
-=========================
+spike_lfp_common_preprocess_batch.py
+====================================
 
 Orchestrateur multi-sessions pour construire la base commune spike–LFP.
 
@@ -81,7 +81,11 @@ class CommonBatchPreprocessConfig:
     require_existing_nwb: bool = False
 
     # Sorties.
+    # overwrite=False : réutilise un common bundle déjà complet.
+    # skip_existing est gardé pour compatibilité et équivaut à overwrite=False.
+    overwrite: bool = False
     skip_existing: bool = False
+    # Gardé pour compatibilité avec d'anciens notebooks ; non utilisé ici.
     must_be_absolute_output: bool = True
     verbose: bool = True
 
@@ -187,6 +191,18 @@ def common_output_exists(common_root: str | Path, session_name: str) -> bool:
     return (d / f"{session_name}_common_trials.csv").exists() and (d / f"{session_name}_common_metadata.json").exists()
 
 
+def validate_common_bundle_output(common_root: str | Path, session_name: str) -> Path:
+    """Vérifie que common_root/SESSION contient les deux fichiers attendus."""
+    root = Path(common_root).expanduser().resolve()
+    d = root / session_name
+    trials = d / f"{session_name}_common_trials.csv"
+    meta = d / f"{session_name}_common_metadata.json"
+    missing = [str(x) for x in (d, trials, meta) if not x.exists()]
+    if missing:
+        raise FileNotFoundError(f"Common bundle incomplet pour {session_name}: {missing}")
+    return d
+
+
 def make_common_preprocess_config(cfg: CommonBatchPreprocessConfig) -> CommonPreprocessConfig:
     return CommonPreprocessConfig(
         micro_root=cfg.micro_root,
@@ -225,10 +241,16 @@ def run_all_common_preprocess(cfg: CommonBatchPreprocessConfig) -> Dict[str, Any
             skipped.append((session_name, f"parse_failed: {exc}"))
             continue
 
-        if cfg.skip_existing and common_output_exists(cfg.common_root, session_name):
-            d = str((Path(cfg.common_root).expanduser().resolve() / session_name))
-            out_dirs.append(d)
-            rows.append({"session": session_name, "patient": patient, "session_num": sess, "status": "skipped_existing", "out_dir": d})
+        if (cfg.skip_existing or not cfg.overwrite) and common_output_exists(cfg.common_root, session_name):
+            d = validate_common_bundle_output(cfg.common_root, session_name)
+            out_dirs.append(str(d))
+            rows.append({
+                "session": session_name,
+                "patient": patient,
+                "session_num": sess,
+                "status": "reused_existing",
+                "out_dir": str(d),
+            })
             continue
 
         nwb_fp = find_nwb_file(cfg.micro_root, patient, sess)
@@ -255,8 +277,9 @@ def run_all_common_preprocess(cfg: CommonBatchPreprocessConfig) -> Dict[str, Any
             out_dir = save_common_session_bundle(
                 bundle,
                 common_root,
-                must_be_absolute=cfg.must_be_absolute_output,
+                overwrite=True,
             )
+            out_dir = validate_common_bundle_output(common_root, session_name)
             qc = validate_common_trials(bundle.trials)
             out_dirs.append(str(out_dir))
             rows.append({
@@ -283,6 +306,13 @@ def run_all_common_preprocess(cfg: CommonBatchPreprocessConfig) -> Dict[str, Any
     summary_csv = common_root / "run_all_common_preprocess_sessions.csv"
     summary_df.to_csv(summary_csv, index=False)
 
+    existing_common_dirs: List[str] = []
+    for sname in sessions:
+        try:
+            existing_common_dirs.append(str(validate_common_bundle_output(common_root, sname)))
+        except Exception:
+            pass
+
     summary = {
         "config": _jsonify(asdict(cfg)),
         "n_sessions_candidate": len(sessions),
@@ -292,6 +322,8 @@ def run_all_common_preprocess(cfg: CommonBatchPreprocessConfig) -> Dict[str, Any
         "n_errors": len(errors),
         "errors": errors,
         "session_output_dirs": out_dirs,
+        "n_existing_common_bundle_dirs": len(existing_common_dirs),
+        "existing_common_bundle_dirs": existing_common_dirs,
         "summary_csv": str(summary_csv),
     }
     with open(common_root / "run_all_common_preprocess_summary.json", "w", encoding="utf-8") as f:
@@ -307,4 +339,6 @@ __all__ = [
     "list_hilbert_sessions",
     "list_macro_corrected_sessions",
     "find_nwb_file",
+    "common_output_exists",
+    "validate_common_bundle_output",
 ]
